@@ -43,9 +43,8 @@ pub fn run_nmf(x: &Array2<f32>, config: &NmfConfig) -> Result<NmfResult> {
     let mut n_iter = config.max_iter;
 
     for iteration in 0..config.max_iter {
-        let wt = w.t().to_owned();
-        let wtx = wt.dot(x);
-        let wtwh = wt.dot(&w).dot(&h);
+        let wtx = w.t().dot(x);
+        let wtwh = w.t().dot(&w).dot(&h);
         Zip::from(&mut h)
             .and(&wtx)
             .and(&wtwh)
@@ -56,9 +55,8 @@ pub fn run_nmf(x: &Array2<f32>, config: &NmfConfig) -> Result<NmfResult> {
                 }
             });
 
-        let ht = h.t().to_owned();
-        let xht = x.dot(&ht);
-        let whht = w.dot(&h.dot(&ht));
+        let xht = x.dot(&h.t());
+        let whht = w.dot(&h.dot(&h.t()));
         Zip::from(&mut w)
             .and(&xht)
             .and(&whht)

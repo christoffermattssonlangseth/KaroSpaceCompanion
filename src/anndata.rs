@@ -729,6 +729,11 @@ fn read_csr_matrix_path(file: &hdf5::File, path: &str) -> Result<CsrMatrix> {
     let indptr_u = read_usize_vec(&group.dataset("indptr").context("reading csr indptr dataset")?)?;
     let (nrows, ncols) = read_csr_shape(&group)?;
     validate_csr_layout(nrows, ncols, data.len(), &indices_u, &indptr_u)?;
+    for &value in indices_u.iter().chain(indptr_u.iter()) {
+        if value > i32::MAX as usize {
+            anyhow::bail!("csr index value {value} overflows i32");
+        }
+    }
     Ok(CsrMatrix {
         data,
         indices: indices_u.into_iter().map(|value| value as i32).collect(),
@@ -841,6 +846,11 @@ fn validate_csr_layout(
             "csr indices length ({}) does not match data length ({data_len})",
             indices.len()
         );
+    }
+    for &v in indptr {
+        if v > data_len {
+            bail!("csr indptr value {v} exceeds data length {data_len}");
+        }
     }
     for window in indptr.windows(2) {
         if window[0] > window[1] {

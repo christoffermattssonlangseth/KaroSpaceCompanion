@@ -135,6 +135,7 @@ fn main() -> Result<()> {
                     pack_arrays_min_len: args.viewer_pack_min_len,
                     gene_sparse_pack_min_nnz: args.viewer_gene_sparse_pack_min_nnz,
                     gene_correlation_top_n: 10,
+                    gene_correlation_n_genes: 200,
                     cluster_means_n_genes: 500,
                     spatial_variable_genes_n: 200,
                     marker_genes_top_n: 30,

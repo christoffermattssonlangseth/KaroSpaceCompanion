@@ -594,6 +594,7 @@ mod tests {
                     pack_arrays_min_len: 1024,
                     gene_sparse_pack_min_nnz: 256,
                     gene_correlation_top_n: 2,
+                    gene_correlation_n_genes: 2,
                     cluster_means_n_genes: 2,
                     spatial_variable_genes_n: 2,
                     marker_genes_top_n: 2,

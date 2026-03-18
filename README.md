@@ -35,6 +35,13 @@ For the Balo test dataset in `~/Downloads`, you can avoid shell copy/paste issue
 bash scripts/run_balo_bms_export.sh
 ```
 
+For the h5ad-native companion pipeline, where analytics are written into
+`uns["karospace_companion"]` and no viewer JSON is produced:
+
+```bash
+bash scripts/run_balo_bms_prepare_h5ad.sh
+```
+
 The v1 `prepare` command:
 
 - copies the input `.h5ad` to a new output path
