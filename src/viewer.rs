@@ -12,7 +12,9 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 
-use crate::anndata::{read_viewer_h5ad, CsrMatrix, ObsColumnData, ViewerAnnDataRead};
+use crate::anndata::{
+    read_viewer_h5ad, CsrMatrix, ExpressionMatrix, ObsColumnData, ViewerAnnDataRead,
+};
 use crate::progress::ProgressReporter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,14 +220,12 @@ pub fn export_viewer_precompute_json_with_analytics(
     let payload = build_payload(&adata, groupby, config, analytics, &reporter)?;
     if let Some(parent) = output_json.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {:?}", parent))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {:?}", parent))?;
         }
     }
     let stage = reporter.stage("Writing viewer JSON");
     let encoded = serde_json::to_vec(&payload).context("serializing viewer precompute JSON")?;
-    fs::write(output_json, encoded)
-        .with_context(|| format!("writing {:?}", output_json))?;
+    fs::write(output_json, encoded).with_context(|| format!("writing {:?}", output_json))?;
     stage.finish(output_json.display().to_string());
     Ok(output_json.clone())
 }
@@ -317,7 +317,11 @@ fn build_payload(
         })
         .collect::<Map<String, Value>>();
 
-    let umap_bounds = adata.umap.as_ref().map(compute_umap_bounds).unwrap_or(Value::Null);
+    let umap_bounds = adata
+        .umap
+        .as_ref()
+        .map(compute_umap_bounds)
+        .unwrap_or(Value::Null);
 
     Ok(json!({
         "initial_color": initial_color,
@@ -362,30 +366,36 @@ fn compute_companion_analytics_from_loaded(
         select_top_variable_gene_indices(&adata.expression, config.gene_correlation_n_genes);
     let top_variable_gene_indices =
         select_top_variable_gene_indices(&adata.expression, config.cluster_means_n_genes);
-    let cluster_gene_means = if !analytics_columns.is_empty() && !top_variable_gene_indices.is_empty()
-    {
-        compute_cluster_gene_means(
-            adata,
-            &analytics_columns,
-            &top_variable_gene_indices,
-            Some(reporter),
-        )
-    } else {
-        Value::Null
-    };
+    let cluster_gene_means =
+        if !analytics_columns.is_empty() && !top_variable_gene_indices.is_empty() {
+            compute_cluster_gene_means(
+                adata,
+                &analytics_columns,
+                &top_variable_gene_indices,
+                Some(reporter),
+            )
+        } else {
+            Value::Null
+        };
 
     let gene_correlations =
         if config.gene_correlation_top_n > 0 && !correlation_gene_indices.is_empty() {
-        compute_gene_correlations(
-            &adata.expression,
-            &correlation_gene_indices,
-            &adata.var_names,
-            config.gene_correlation_top_n,
-            Some(reporter),
-        )
-    } else {
-        Value::Object(Map::new())
-    };
+            let selected_gene_names = correlation_gene_indices
+                .iter()
+                .map(|index| adata.var_names[*index].clone())
+                .collect::<Vec<_>>();
+            let selected_matrix = adata
+                .expression
+                .select_columns_dense(&correlation_gene_indices);
+            compute_gene_correlations(
+                &selected_matrix,
+                &selected_gene_names,
+                config.gene_correlation_top_n,
+                Some(reporter),
+            )
+        } else {
+            Value::Object(Map::new())
+        };
 
     let spatial_variable_genes = if config.spatial_variable_genes_n > 0 {
         if let Some(graph) = &adata.graph {
@@ -393,11 +403,15 @@ fn compute_companion_analytics_from_loaded(
                 &adata.expression,
                 config.spatial_variable_genes_n,
             );
+            let selected_gene_names = svg_genes
+                .iter()
+                .map(|index| adata.var_names[*index].clone())
+                .collect::<Vec<_>>();
+            let selected_matrix = adata.expression.select_columns_dense(&svg_genes);
             compute_spatial_variable_genes(
-                &adata.expression,
+                &selected_matrix,
                 graph,
-                &adata.var_names,
-                &svg_genes,
+                &selected_gene_names,
                 Some(reporter),
             )
         } else {
@@ -579,7 +593,7 @@ fn build_gene_export_meta(
     gene_indices
         .iter()
         .map(|&index| {
-            let column = adata.expression.column(index);
+            let column = adata.expression.column_dense(index);
             let mut finite_min = f64::INFINITY;
             let mut finite_max = f64::NEG_INFINITY;
             let mut nonzero = 0usize;
@@ -716,27 +730,21 @@ fn build_sections_json(
             section.insert("y".to_string(), Value::Null);
             section.insert("xb64".to_string(), Value::String(encode_f32_b64(&coords_x)));
             section.insert("yb64".to_string(), Value::String(encode_f32_b64(&coords_y)));
-            section.insert(
-                "obs_idx".to_string(),
-                Value::Null,
-            );
+            section.insert("obs_idx".to_string(), Value::Null);
             section.insert(
                 "obs_idxb64".to_string(),
                 Value::String(encode_u32_b64(
-                    &indices.iter().map(|index| *index as u32).collect::<Vec<_>>(),
+                    &indices
+                        .iter()
+                        .map(|index| *index as u32)
+                        .collect::<Vec<_>>(),
                 )),
             );
         } else {
             section.insert("x".to_string(), f32_vec_to_json(&coords_x));
             section.insert("y".to_string(), f32_vec_to_json(&coords_y));
-            section.insert(
-                "xb64".to_string(),
-                Value::Null,
-            );
-            section.insert(
-                "yb64".to_string(),
-                Value::Null,
-            );
+            section.insert("xb64".to_string(), Value::Null);
+            section.insert("yb64".to_string(), Value::Null);
             section.insert(
                 "obs_idx".to_string(),
                 Value::Array(indices.iter().map(|index| json!(*index)).collect()),
@@ -756,8 +764,14 @@ fn build_sections_json(
             if config.pack_arrays && n_cells >= config.pack_arrays_min_len {
                 section.insert("umap_x".to_string(), Value::Null);
                 section.insert("umap_y".to_string(), Value::Null);
-                section.insert("umap_xb64".to_string(), Value::String(encode_f32_b64(&umap_x)));
-                section.insert("umap_yb64".to_string(), Value::String(encode_f32_b64(&umap_y)));
+                section.insert(
+                    "umap_xb64".to_string(),
+                    Value::String(encode_f32_b64(&umap_x)),
+                );
+                section.insert(
+                    "umap_yb64".to_string(),
+                    Value::String(encode_f32_b64(&umap_y)),
+                );
             } else {
                 section.insert("umap_x".to_string(), f32_vec_to_json(&umap_x));
                 section.insert("umap_y".to_string(), f32_vec_to_json(&umap_y));
@@ -840,15 +854,16 @@ fn build_section_colors(
             .get(name)
             .with_context(|| format!("missing cached color column '{name}'"))?;
         let values = if column.is_continuous() {
-            column
-                .numeric_values_f32()
-                .expect("checked numeric column")
+            column.numeric_values_f32().expect("checked numeric column")
         } else {
             column
                 .categorical_codes_f32()
                 .expect("checked categorical column")
         };
-        let section_values = indices.iter().map(|index| values[*index]).collect::<Vec<_>>();
+        let section_values = indices
+            .iter()
+            .map(|index| values[*index])
+            .collect::<Vec<_>>();
         if pack {
             colors_b64.insert(name.clone(), Value::String(encode_f32_b64(&section_values)));
         } else {
@@ -869,7 +884,7 @@ fn build_section_genes(
     for gene in genes {
         let values = indices
             .iter()
-            .map(|index| adata.expression[[*index, gene.index]])
+            .map(|index| adata.expression.get(*index, gene.index))
             .collect::<Vec<_>>();
         match gene.encoding {
             GeneEncodingMode::Dense => {
@@ -991,9 +1006,9 @@ fn resolve_analytics_columns(
             .collect();
         let mut selected = Vec::with_capacity(names.len());
         for name in names {
-            let column = lookup
-                .get(name.as_str())
-                .with_context(|| format!("viewer analytics column '{name}' is missing or not categorical"))?;
+            let column = lookup.get(name.as_str()).with_context(|| {
+                format!("viewer analytics column '{name}' is missing or not categorical")
+            })?;
             selected.push((*column).clone());
         }
         return Ok(selected);
@@ -1001,32 +1016,43 @@ fn resolve_analytics_columns(
     Ok(categorical_columns.to_vec())
 }
 
-fn select_top_variable_gene_indices(
-    matrix: &ndarray::Array2<f32>,
-    n: usize,
-) -> Vec<usize> {
+fn select_top_variable_gene_indices(matrix: &ExpressionMatrix, n: usize) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
-    let mut scored = Vec::with_capacity(matrix.ncols());
-    for gene_idx in 0..matrix.ncols() {
-        let column = matrix.column(gene_idx);
-        if column.is_empty() {
-            continue;
-        }
-        let mean = column.iter().copied().map(f64::from).sum::<f64>() / column.len() as f64;
-        let mean_sq = column
-            .iter()
-            .copied()
-            .map(|value| {
-                let v = f64::from(value);
-                v * v
-            })
-            .sum::<f64>()
-            / column.len() as f64;
-        let variance = mean_sq - mean * mean;
-        scored.push((gene_idx, variance));
+    let nrows = matrix.nrows();
+    if nrows == 0 {
+        return Vec::new();
     }
+    let mut sums = vec![0.0f64; matrix.ncols()];
+    let mut sums_sq = vec![0.0f64; matrix.ncols()];
+    match matrix {
+        ExpressionMatrix::Dense(dense) => {
+            for row in dense.rows() {
+                for (gene_idx, value) in row.iter().copied().enumerate() {
+                    let value = f64::from(value);
+                    sums[gene_idx] += value;
+                    sums_sq[gene_idx] += value * value;
+                }
+            }
+        }
+        ExpressionMatrix::Sparse(sparse) => {
+            for row_idx in 0..sparse.nrows {
+                sparse.for_each_nonzero_in_row(row_idx, |gene_idx, value| {
+                    let value = f64::from(value);
+                    sums[gene_idx] += value;
+                    sums_sq[gene_idx] += value * value;
+                });
+            }
+        }
+    }
+    let mut scored = (0..matrix.ncols())
+        .map(|gene_idx| {
+            let mean = sums[gene_idx] / nrows as f64;
+            let mean_sq = sums_sq[gene_idx] / nrows as f64;
+            (gene_idx, mean_sq - mean * mean)
+        })
+        .collect::<Vec<_>>();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     scored.into_iter().take(n).map(|(index, _)| index).collect()
 }
@@ -1045,7 +1071,7 @@ fn compute_cluster_gene_means(
     let background = gene_indices
         .iter()
         .map(|index| {
-            let column = adata.expression.column(*index);
+            let column = adata.expression.column_dense(*index);
             if column.is_empty() {
                 0.0
             } else {
@@ -1108,16 +1134,15 @@ fn compute_cluster_gene_means(
 
 fn compute_gene_correlations(
     matrix: &ndarray::Array2<f32>,
-    gene_indices: &[usize],
     gene_names: &[String],
     top_n: usize,
     reporter: Option<&ProgressReporter>,
 ) -> Value {
     let stage = reporter.map(|reporter| reporter.stage("Computing gene correlations"));
-    let mut centered = Vec::with_capacity(gene_indices.len());
-    let mut norms = Vec::with_capacity(gene_indices.len());
-    for &gene_idx in gene_indices {
-        let column = matrix.column(gene_idx);
+    let mut centered = Vec::with_capacity(matrix.ncols());
+    let mut norms = Vec::with_capacity(matrix.ncols());
+    for gene_offset in 0..matrix.ncols() {
+        let column = matrix.column(gene_offset);
         let mean = if column.is_empty() {
             0.0
         } else {
@@ -1133,15 +1158,15 @@ fn compute_gene_correlations(
         norms.push(norm);
     }
 
-    let entries: Vec<(String, Value)> = gene_indices
+    let entries: Vec<(String, Value)> = (0..matrix.ncols())
+        .collect::<Vec<_>>()
         .par_iter()
-        .enumerate()
-        .map(|(i, &gene_idx)| {
+        .map(|&i| {
             if top_n == 0 || norms[i] == 0.0 {
-                return (gene_names[gene_idx].clone(), Value::Array(Vec::new()));
+                return (gene_names[i].clone(), Value::Array(Vec::new()));
             }
             let mut scores = Vec::new();
-            for (j, &other_gene_idx) in gene_indices.iter().enumerate() {
+            for j in 0..matrix.ncols() {
                 if i == j || norms[j] == 0.0 {
                     continue;
                 }
@@ -1152,7 +1177,7 @@ fn compute_gene_correlations(
                     .sum::<f64>();
                 let r = dot / (norms[i] * norms[j]);
                 if r > 0.0 && r.is_finite() {
-                    scores.push((other_gene_idx, r));
+                    scores.push((j, r));
                 }
             }
             scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -1166,12 +1191,12 @@ fn compute_gene_correlations(
                     })
                 })
                 .collect::<Vec<_>>();
-            (gene_names[gene_idx].clone(), Value::Array(payload))
+            (gene_names[i].clone(), Value::Array(payload))
         })
         .collect();
     let out: Map<String, Value> = entries.into_iter().collect();
     if let Some(stage) = stage {
-        stage.finish(format!("genes={}, top_n={}", gene_indices.len(), top_n));
+        stage.finish(format!("genes={}, top_n={}", matrix.ncols(), top_n));
     }
     Value::Object(out)
 }
@@ -1180,14 +1205,17 @@ fn compute_spatial_variable_genes(
     matrix: &ndarray::Array2<f32>,
     graph: &CsrMatrix,
     gene_names: &[String],
-    gene_indices: &[usize],
     reporter: Option<&ProgressReporter>,
 ) -> Value {
     let stage = reporter.map(|reporter| reporter.stage("Computing spatial variable genes"));
     let neighbors = graph_neighbors_from_csr(graph);
     let row_sums = neighbors
         .iter()
-        .map(|row| row.iter().map(|(_, weight)| f64::from(*weight)).sum::<f64>())
+        .map(|row| {
+            row.iter()
+                .map(|(_, weight)| f64::from(*weight))
+                .sum::<f64>()
+        })
         .collect::<Vec<_>>();
     let s0 = row_sums.iter().sum::<f64>();
     if s0 == 0.0 {
@@ -1195,12 +1223,12 @@ fn compute_spatial_variable_genes(
     }
 
     let n = matrix.nrows() as f64;
-    let mut scored: Vec<(usize, f64)> = gene_indices
+    let mut scored: Vec<(usize, f64)> = (0..matrix.ncols())
+        .collect::<Vec<_>>()
         .par_iter()
         .filter_map(|&gene_idx| {
             let column = matrix.column(gene_idx);
-            let mean =
-                column.iter().copied().map(f64::from).sum::<f64>() / column.len() as f64;
+            let mean = column.iter().copied().map(f64::from).sum::<f64>() / column.len() as f64;
             let z = column
                 .iter()
                 .copied()
@@ -1221,11 +1249,11 @@ fn compute_spatial_variable_genes(
                 }
                 wz[row_idx] = acc;
             }
-            let numerator = n
-                * z.iter()
-                    .zip(wz.iter())
-                    .map(|(lhs, rhs)| lhs * rhs)
-                    .sum::<f64>();
+            let numerator = n * z
+                .iter()
+                .zip(wz.iter())
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum::<f64>();
             let i_value = (numerator / (s0 * denom)).clamp(-1.0, 1.0);
             Some((gene_idx, i_value))
         })
@@ -1243,13 +1271,13 @@ fn compute_spatial_variable_genes(
             .collect(),
     );
     if let Some(stage) = stage {
-        stage.finish(format!("genes={}", gene_indices.len()));
+        stage.finish(format!("genes={}", matrix.ncols()));
     }
     result
 }
 
 fn compute_marker_genes(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     gene_names: &[String],
     categorical_columns: &[(String, Vec<String>, Vec<String>)],
     top_n: usize,
@@ -1302,7 +1330,7 @@ fn compute_marker_genes(
 }
 
 fn compute_cluster_de(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     gene_names: &[String],
     categorical_columns: &[(String, Vec<String>, Vec<String>)],
     top_n: usize,
@@ -1414,7 +1442,11 @@ fn compute_cluster_de(
         }
     }
     if let Some(stage) = stage {
-        stage.finish(format!("columns={}, method={:?}", categorical_columns.len(), method));
+        stage.finish(format!(
+            "columns={}, method={:?}",
+            categorical_columns.len(),
+            method
+        ));
     }
     Value::Object(out)
 }
@@ -1442,7 +1474,8 @@ fn compute_neighbor_stats(
             ));
         }
         let codes = categorical_codes(values, categories);
-        let (counts, n_cells, mean_degree) = directed_neighbor_counts(&neighbors, &codes, categories.len());
+        let (counts, n_cells, mean_degree) =
+            directed_neighbor_counts(&neighbors, &codes, categories.len());
         let zscores = if permutations > 0 {
             Some(permutation_neighbor_zscores(
                 &neighbors,
@@ -1494,7 +1527,7 @@ fn compute_neighbor_stats(
 }
 
 fn compute_interaction_markers(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     gene_names: &[String],
     categorical_columns: &[(String, Vec<String>, Vec<String>)],
     contexts: &HashMap<String, NeighborStatsContext>,
@@ -1597,7 +1630,8 @@ fn compute_interaction_markers(
                         neighbors[*cell_idx]
                             .iter()
                             .filter(|(neighbor_idx, _)| {
-                                ctx.codes.get(*neighbor_idx).and_then(|code| *code) == Some(target_idx)
+                                ctx.codes.get(*neighbor_idx).and_then(|code| *code)
+                                    == Some(target_idx)
                             })
                             .count()
                     })
@@ -1721,7 +1755,7 @@ fn compute_interaction_markers(
 }
 
 fn build_categorical_column_summary(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     values: &[String],
     categories: &[String],
 ) -> CategoricalColumnSummary {
@@ -1736,10 +1770,9 @@ fn build_categorical_column_summary(
         let Some(code) = code else {
             continue;
         };
-        let row = matrix.row(row_idx);
         group_summaries[code].n_cells += 1;
         total.n_cells += 1;
-        for (gene_idx, value) in row.iter().copied().enumerate() {
+        matrix.for_each_nonzero_in_row(row_idx, |gene_idx, value| {
             let value = f64::from(value);
             group_summaries[code].sums[gene_idx] += value;
             group_summaries[code].sums_sq[gene_idx] += value * value;
@@ -1749,7 +1782,7 @@ fn build_categorical_column_summary(
                 group_summaries[code].nnz[gene_idx] += 1;
                 total.nnz[gene_idx] += 1;
             }
-        }
+        });
     }
 
     CategoricalColumnSummary {
@@ -1814,7 +1847,7 @@ fn differential_expression_from_summaries(
 }
 
 fn differential_expression(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     gene_names: &[String],
     group_a: &[usize],
     group_b: &[usize],
@@ -1839,14 +1872,21 @@ fn differential_expression(
         };
         let p_value = two_sided_p_from_z(score);
         let logfc = ((mean_a[gene_idx] + 1e-9) / (mean_b[gene_idx] + 1e-9)).log2();
-        stats.push((gene_idx, score, p_value, logfc, pct_a[gene_idx], pct_b[gene_idx]));
+        stats.push((
+            gene_idx,
+            score,
+            p_value,
+            logfc,
+            pct_a[gene_idx],
+            pct_b[gene_idx],
+        ));
     }
 
     finalize_de_stats(gene_names, stats, top_n)
 }
 
 fn differential_expression_subset(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     gene_names: &[String],
     gene_indices: &[usize],
     group_a: &[usize],
@@ -1870,7 +1910,14 @@ fn differential_expression_subset(
                 );
                 let p_value = two_sided_p_from_z(score);
                 let logfc = ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
-                stats.push((gene_idx, score, p_value, logfc, pct_a[offset], pct_b[offset]));
+                stats.push((
+                    gene_idx,
+                    score,
+                    p_value,
+                    logfc,
+                    pct_a[offset],
+                    pct_b[offset],
+                ));
             }
             finalize_de_stats(gene_names, stats, top_n)
         }
@@ -1883,9 +1930,15 @@ fn differential_expression_subset(
                 .map(|(offset, &gene_idx)| {
                     let score = wilcoxon_rank_sum_score(matrix, gene_idx, group_a, group_b);
                     let p_value = two_sided_p_from_z(score);
-                    let logfc =
-                        ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
-                    (gene_idx, score, p_value, logfc, pct_a[offset], pct_b[offset])
+                    let logfc = ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
+                    (
+                        gene_idx,
+                        score,
+                        p_value,
+                        logfc,
+                        pct_a[offset],
+                        pct_b[offset],
+                    )
                 })
                 .collect();
             finalize_de_stats(gene_names, stats, top_n)
@@ -1918,14 +1971,7 @@ fn finalize_de_stats(
         .into_iter()
         .enumerate()
         .map(|(idx, (gene_idx, score, _p, logfc, pct_a, pct_b))| {
-            (
-                gene_idx,
-                score,
-                adjusted[idx],
-                logfc,
-                pct_a,
-                pct_b,
-            )
+            (gene_idx, score, adjusted[idx], logfc, pct_a, pct_b)
         })
         .collect::<Vec<_>>();
     scored.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
@@ -1964,20 +2010,44 @@ fn finalize_de_stats(
 }
 
 fn summarize_group_subset(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     indices: &[usize],
     gene_indices: &[usize],
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut sums = vec![0.0f64; gene_indices.len()];
     let mut sums_sq = vec![0.0f64; gene_indices.len()];
     let mut nnz = vec![0usize; gene_indices.len()];
-    for row_idx in indices {
-        for (offset, gene_idx) in gene_indices.iter().copied().enumerate() {
-            let value = f64::from(matrix[[*row_idx, gene_idx]]);
-            sums[offset] += value;
-            sums_sq[offset] += value * value;
-            if value > 0.0 {
-                nnz[offset] += 1;
+    match matrix {
+        ExpressionMatrix::Dense(dense) => {
+            for row_idx in indices {
+                for (offset, gene_idx) in gene_indices.iter().copied().enumerate() {
+                    let value = f64::from(dense[[*row_idx, gene_idx]]);
+                    sums[offset] += value;
+                    sums_sq[offset] += value * value;
+                    if value > 0.0 {
+                        nnz[offset] += 1;
+                    }
+                }
+            }
+        }
+        ExpressionMatrix::Sparse(sparse) => {
+            let lookup: HashMap<usize, usize> = gene_indices
+                .iter()
+                .enumerate()
+                .map(|(offset, &gene_idx)| (gene_idx, offset))
+                .collect();
+            for row_idx in indices {
+                sparse.for_each_nonzero_in_row(*row_idx, |gene_idx, value| {
+                    let Some(&offset) = lookup.get(&gene_idx) else {
+                        return;
+                    };
+                    let value = f64::from(value);
+                    sums[offset] += value;
+                    sums_sq[offset] += value * value;
+                    if value > 0.0 {
+                        nnz[offset] += 1;
+                    }
+                });
             }
         }
     }
@@ -1995,20 +2065,33 @@ fn summarize_group_subset(
     (means, vars, pct)
 }
 
-fn summarize_group(
-    matrix: &ndarray::Array2<f32>,
-    indices: &[usize],
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+fn summarize_group(matrix: &ExpressionMatrix, indices: &[usize]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut sums = vec![0.0f64; matrix.ncols()];
     let mut sums_sq = vec![0.0f64; matrix.ncols()];
     let mut nnz = vec![0usize; matrix.ncols()];
-    for row_idx in indices {
-        for gene_idx in 0..matrix.ncols() {
-            let value = f64::from(matrix[[*row_idx, gene_idx]]);
-            sums[gene_idx] += value;
-            sums_sq[gene_idx] += value * value;
-            if value > 0.0 {
-                nnz[gene_idx] += 1;
+    match matrix {
+        ExpressionMatrix::Dense(dense) => {
+            for row_idx in indices {
+                for gene_idx in 0..matrix.ncols() {
+                    let value = f64::from(dense[[*row_idx, gene_idx]]);
+                    sums[gene_idx] += value;
+                    sums_sq[gene_idx] += value * value;
+                    if value > 0.0 {
+                        nnz[gene_idx] += 1;
+                    }
+                }
+            }
+        }
+        ExpressionMatrix::Sparse(sparse) => {
+            for row_idx in indices {
+                sparse.for_each_nonzero_in_row(*row_idx, |gene_idx, value| {
+                    let value = f64::from(value);
+                    sums[gene_idx] += value;
+                    sums_sq[gene_idx] += value * value;
+                    if value > 0.0 {
+                        nnz[gene_idx] += 1;
+                    }
+                });
             }
         }
     }
@@ -2026,14 +2109,7 @@ fn summarize_group(
     (means, vars, pct)
 }
 
-fn welch_t_score(
-    mean_a: f64,
-    mean_b: f64,
-    var_a: f64,
-    var_b: f64,
-    n_a: usize,
-    n_b: usize,
-) -> f64 {
+fn welch_t_score(mean_a: f64, mean_b: f64, var_a: f64, var_b: f64, n_a: usize, n_b: usize) -> f64 {
     if var_a == 0.0 && var_b == 0.0 && mean_a == mean_b {
         return 0.0;
     }
@@ -2042,7 +2118,7 @@ fn welch_t_score(
 }
 
 fn wilcoxon_rank_sum_score(
-    matrix: &ndarray::Array2<f32>,
+    matrix: &ExpressionMatrix,
     gene_idx: usize,
     group_a: &[usize],
     group_b: &[usize],
@@ -2052,10 +2128,10 @@ fn wilcoxon_rank_sum_score(
     }
     let mut values = Vec::with_capacity(group_a.len() + group_b.len());
     for idx in group_a {
-        values.push((f64::from(matrix[[*idx, gene_idx]]), true));
+        values.push((f64::from(matrix.get(*idx, gene_idx)), true));
     }
     for idx in group_b {
-        values.push((f64::from(matrix[[*idx, gene_idx]]), false));
+        values.push((f64::from(matrix.get(*idx, gene_idx)), false));
     }
     values.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap_or(Ordering::Equal));
 
@@ -2085,11 +2161,7 @@ fn benjamini_hochberg(p_values: &[f64]) -> Vec<f64> {
     if p_values.is_empty() {
         return Vec::new();
     }
-    let mut indexed = p_values
-        .iter()
-        .copied()
-        .enumerate()
-        .collect::<Vec<_>>();
+    let mut indexed = p_values.iter().copied().enumerate().collect::<Vec<_>>();
     indexed.sort_by(|lhs, rhs| lhs.1.partial_cmp(&rhs.1).unwrap_or(Ordering::Equal));
     let n = p_values.len() as f64;
     let mut adjusted = vec![1.0; p_values.len()];
@@ -2117,8 +2189,7 @@ fn erf(x: f64) -> f64 {
     let a5 = 1.061405429;
     let p = 0.3275911;
     let t = 1.0 / (1.0 + p * x);
-    let y = 1.0
-        - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * (-x * x).exp());
+    let y = 1.0 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * (-x * x).exp());
     sign * y
 }
 
@@ -2270,13 +2341,13 @@ fn compute_umap_bounds(umap: &ndarray::Array2<f64>) -> Value {
     })
 }
 
-fn mean_for_indices(matrix: &ndarray::Array2<f32>, gene_idx: usize, indices: &[usize]) -> f64 {
+fn mean_for_indices(matrix: &ExpressionMatrix, gene_idx: usize, indices: &[usize]) -> f64 {
     if indices.is_empty() {
         return 0.0;
     }
     indices
         .iter()
-        .map(|row_idx| f64::from(matrix[[*row_idx, gene_idx]]))
+        .map(|row_idx| f64::from(matrix.get(*row_idx, gene_idx)))
         .sum::<f64>()
         / indices.len() as f64
 }
@@ -2419,40 +2490,44 @@ mod tests {
 
     #[test]
     fn gene_correlations_default_to_top_200_variable_genes() {
-        with_temp_paths("viewer-gene-correlations-bounded", |input, _output, _json_path| {
-            create_wide_test_h5ad(input, 205);
-            let config = ViewerPrecomputeConfig {
-                output_json: None,
-                initial_color: Some("cell_type".to_string()),
-                genes: None,
-                analytics_columns: Some(vec!["cell_type".to_string()]),
-                include_interaction_markers: false,
-                gene_encoding: GeneEncodingMode::Auto,
-                gene_sparse_zero_threshold: 0.8,
-                pack_arrays: false,
-                pack_arrays_min_len: 1024,
-                gene_sparse_pack_min_nnz: 256,
-                gene_correlation_top_n: 3,
-                gene_correlation_n_genes: 200,
-                cluster_means_n_genes: 3,
-                spatial_variable_genes_n: 3,
-                marker_genes_top_n: 3,
-                cluster_de_method: DeMethod::TTest,
-                cluster_de_top_n: 3,
-                cluster_de_min_cells: 1,
-                neighbor_stats_seed: 0,
-                interaction_markers_method: DeMethod::TTest,
-                interaction_markers_gene_limit: 3,
-                interaction_markers_top_targets: 2,
-                interaction_markers_top_genes: 3,
-                interaction_markers_min_cells: 1,
-                interaction_markers_min_neighbors: 1,
-            };
+        with_temp_paths(
+            "viewer-gene-correlations-bounded",
+            |input, _output, _json_path| {
+                create_wide_test_h5ad(input, 205);
+                let config = ViewerPrecomputeConfig {
+                    output_json: None,
+                    initial_color: Some("cell_type".to_string()),
+                    genes: None,
+                    analytics_columns: Some(vec!["cell_type".to_string()]),
+                    include_interaction_markers: false,
+                    gene_encoding: GeneEncodingMode::Auto,
+                    gene_sparse_zero_threshold: 0.8,
+                    pack_arrays: false,
+                    pack_arrays_min_len: 1024,
+                    gene_sparse_pack_min_nnz: 256,
+                    gene_correlation_top_n: 3,
+                    gene_correlation_n_genes: 200,
+                    cluster_means_n_genes: 3,
+                    spatial_variable_genes_n: 3,
+                    marker_genes_top_n: 3,
+                    cluster_de_method: DeMethod::TTest,
+                    cluster_de_top_n: 3,
+                    cluster_de_min_cells: 1,
+                    neighbor_stats_seed: 0,
+                    interaction_markers_method: DeMethod::TTest,
+                    interaction_markers_gene_limit: 3,
+                    interaction_markers_top_targets: 2,
+                    interaction_markers_top_genes: 3,
+                    interaction_markers_min_cells: 1,
+                    interaction_markers_min_neighbors: 1,
+                };
 
-            let analytics = compute_companion_analytics(input, Some("sample"), &config).unwrap();
-            let gene_correlations = analytics.gene_correlations.as_object().unwrap();
-            assert_eq!(gene_correlations.len(), 200);
-        });
+                let analytics =
+                    compute_companion_analytics(input, Some("sample"), &config).unwrap();
+                let gene_correlations = analytics.gene_correlations.as_object().unwrap();
+                assert_eq!(gene_correlations.len(), 200);
+            },
+        );
     }
 
     fn create_test_h5ad(path: &Path) {
@@ -2591,9 +2666,17 @@ mod tests {
     fn set_dict_attrs(group: &hdf5::Group) {
         let enc = VarLenUnicode::from_str("dict").unwrap();
         let ver = VarLenUnicode::from_str("0.1.0").unwrap();
-        let attr = group.new_attr::<VarLenUnicode>().shape(()).create("encoding-type").unwrap();
+        let attr = group
+            .new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("encoding-type")
+            .unwrap();
         attr.write_scalar(&enc).unwrap();
-        let attr = group.new_attr::<VarLenUnicode>().shape(()).create("encoding-version").unwrap();
+        let attr = group
+            .new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("encoding-version")
+            .unwrap();
         attr.write_scalar(&ver).unwrap();
     }
 
@@ -2609,18 +2692,38 @@ mod tests {
         let group = parent.create_group(name).unwrap();
         let enc = VarLenUnicode::from_str("csr_matrix").unwrap();
         let ver = VarLenUnicode::from_str("0.1.0").unwrap();
-        let attr = group.new_attr::<VarLenUnicode>().shape(()).create("encoding-type").unwrap();
+        let attr = group
+            .new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("encoding-type")
+            .unwrap();
         attr.write_scalar(&enc).unwrap();
-        let attr = group.new_attr::<VarLenUnicode>().shape(()).create("encoding-version").unwrap();
+        let attr = group
+            .new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("encoding-version")
+            .unwrap();
         attr.write_scalar(&ver).unwrap();
         group
             .new_attr_builder()
             .with_data(&[nrows as i64, ncols as i64])
             .create("shape")
             .unwrap();
-        group.new_dataset_builder().with_data(data).create("data").unwrap();
-        group.new_dataset_builder().with_data(indices).create("indices").unwrap();
-        group.new_dataset_builder().with_data(indptr).create("indptr").unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(data)
+            .create("data")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(indices)
+            .create("indices")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(indptr)
+            .create("indptr")
+            .unwrap();
     }
 
     fn with_temp_paths(name: &str, f: impl FnOnce(&Path, &Path, &Path)) {

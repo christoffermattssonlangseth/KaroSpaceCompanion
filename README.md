@@ -5,9 +5,9 @@ Rust CLI for preparing KaroSpace-ready `.h5ad` files.
 Current entrypoint:
 
 ```bash
-cargo run -- prepare input.h5ad \
+cargo run --release --offline -- prepare input.h5ad \
   --output enriched.h5ad \
-  --radius 50 \
+  --delaunay \
   --groupby sample \
   --composition-cell-type cell_type
 ```
@@ -15,9 +15,9 @@ cargo run -- prepare input.h5ad \
 Viewer-ready export:
 
 ```bash
-cargo run -- prepare input.h5ad \
+cargo run --release --offline -- prepare input.h5ad \
   --output enriched.h5ad \
-  --radius 50 \
+  --delaunay \
   --groupby sample \
   --composition-cell-type cell_type \
   --viewer-json viewer_precompute.json \
@@ -70,6 +70,7 @@ Notes:
 
 - `--persist-analytics-in-h5ad` computes and stores the downstream analytics in the `.h5ad` even if you do not write a viewer JSON.
 - `--viewer-json` uses `layers["normalized"]` for gene vectors and analytics when present, otherwise `X`.
+- `--delaunay` builds the graph per `--groupby` section and then trims links above `--remove-long-links-percentile` (default `99.0`), mirroring the Squidpy + CellCharter pattern.
 - Omitting `--viewer-genes` exports all genes into the viewer JSON. That is complete, but it can become very large on real datasets.
 - Dense section arrays can be packed to base64 for coordinates, colors, UMAP, and edges. Sparse gene sections can be packed with `ib64`/`vb64`.
 - `--viewer-analytics-columns` limits the expensive precomputations (`cluster_de`, `neighbor_stats`, `interaction_markers`, `marker_genes`, `cluster_gene_means`) to the categorical columns you name. This is the practical way to run large datasets.

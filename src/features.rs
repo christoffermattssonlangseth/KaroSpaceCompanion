@@ -2,21 +2,51 @@ use std::collections::{BTreeSet, HashMap};
 
 use ndarray::Array2;
 
-pub fn normalize_counts(matrix: &Array2<f32>, target_sum: f32, log1p: bool) -> Array2<f32> {
-    let mut normalized = matrix.clone();
-    for mut row in normalized.rows_mut() {
-        let total: f32 = row.iter().copied().sum();
-        if total > 0.0 {
-            let scale = target_sum / total;
-            for value in &mut row {
-                *value *= scale;
-                if log1p {
-                    *value = value.ln_1p();
+use crate::anndata::ExpressionMatrix;
+
+pub fn normalize_counts(matrix: &ExpressionMatrix, target_sum: f32, log1p: bool) -> Array2<f32> {
+    match matrix {
+        ExpressionMatrix::Dense(dense) => {
+            let mut normalized = dense.clone();
+            for mut row in normalized.rows_mut() {
+                let total: f32 = row.iter().copied().sum();
+                if total > 0.0 {
+                    let scale = target_sum / total;
+                    for value in &mut row {
+                        *value *= scale;
+                        if log1p {
+                            *value = value.ln_1p();
+                        }
+                    }
                 }
             }
+            normalized
+        }
+        ExpressionMatrix::Sparse(sparse) => {
+            let mut row_sums = vec![0.0f32; sparse.nrows];
+            for (row, row_sum) in row_sums.iter_mut().enumerate() {
+                sparse.for_each_nonzero_in_row(row, |_, value| {
+                    *row_sum += value;
+                });
+            }
+
+            let mut normalized = Array2::<f32>::zeros((sparse.nrows, sparse.ncols));
+            for (row, total) in row_sums.into_iter().enumerate() {
+                if total <= 0.0 {
+                    continue;
+                }
+                let scale = target_sum / total;
+                sparse.for_each_nonzero_in_row(row, |col, value| {
+                    let mut scaled = value * scale;
+                    if log1p {
+                        scaled = scaled.ln_1p();
+                    }
+                    normalized[[row, col]] = scaled;
+                });
+            }
+            normalized
         }
     }
-    normalized
 }
 
 pub fn aggregate_neighbors(neighbors: &[Vec<(usize, f32)>], source: &Array2<f32>) -> Array2<f32> {
@@ -83,11 +113,12 @@ mod tests {
     use ndarray::arr2;
 
     use super::{aggregate_neighbors, compute_composition_matrix, normalize_counts};
+    use crate::anndata::ExpressionMatrix;
 
     #[test]
     fn normalize_counts_log1p_scales_rows() {
         let matrix = arr2(&[[1.0f32, 1.0], [0.0, 4.0]]);
-        let normalized = normalize_counts(&matrix, 10.0, false);
+        let normalized = normalize_counts(&ExpressionMatrix::Dense(matrix), 10.0, false);
         assert_eq!(normalized[[0, 0]], 5.0);
         assert_eq!(normalized[[0, 1]], 5.0);
         assert_eq!(normalized[[1, 1]], 10.0);

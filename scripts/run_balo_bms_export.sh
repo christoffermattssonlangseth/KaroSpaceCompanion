@@ -5,9 +5,9 @@ INPUT="${1:-/Users/chrislangseth/Downloads/baloMS_indep_clust_balo_MANA_balo_ann
 OUTPUT_H5AD="${2:-/tmp/baloMS_full.fast.enriched.h5ad}"
 OUTPUT_JSON="${3:-/tmp/baloMS_full.fast.viewer.json}"
 
-cargo run --offline -- prepare "$INPUT" \
+cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \
-  --k 8 \
+  --delaunay \
   --groupby sample_id \
   --composition-cell-type leiden_2_names_sub \
   --skip-normalized-layer \

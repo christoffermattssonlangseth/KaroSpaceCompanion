@@ -9,8 +9,8 @@ pub struct ProgressReporter {
 
 impl ProgressReporter {
     pub fn new(prefix: impl Into<String>) -> Self {
-        let enabled = io::stderr().is_terminal()
-            && env::var_os("KAROSPACE_COMPANION_NO_PROGRESS").is_none();
+        let enabled =
+            io::stderr().is_terminal() && env::var_os("KAROSPACE_COMPANION_NO_PROGRESS").is_none();
         Self {
             prefix: prefix.into(),
             enabled,

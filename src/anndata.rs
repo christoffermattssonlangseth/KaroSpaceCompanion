@@ -55,7 +55,7 @@ pub struct AnnDataRead {
     pub var_names: Vec<String>,
     pub coordinates: Array2<f64>,
     pub obs: HashMap<String, Vec<String>>,
-    pub expression: Option<Array2<f32>>,
+    pub expression: Option<ExpressionMatrix>,
     pub embeddings: HashMap<String, Array2<f64>>,
 }
 
@@ -146,7 +146,7 @@ pub struct ViewerAnnDataRead {
     pub coordinates: Array2<f64>,
     pub obs_order: Vec<String>,
     pub obs_columns: HashMap<String, ObsColumnData>,
-    pub expression: Array2<f32>,
+    pub expression: ExpressionMatrix,
     pub expression_source: String,
     pub umap: Option<Array2<f64>>,
     pub graph: Option<CsrMatrix>,
@@ -171,6 +171,126 @@ pub struct CsrMatrix {
     pub indptr: Vec<i32>,
     pub nrows: usize,
     pub ncols: usize,
+}
+
+#[derive(Clone)]
+pub enum ExpressionMatrix {
+    Dense(Array2<f32>),
+    Sparse(CsrMatrix),
+}
+
+impl ExpressionMatrix {
+    pub fn nrows(&self) -> usize {
+        match self {
+            Self::Dense(matrix) => matrix.nrows(),
+            Self::Sparse(matrix) => matrix.nrows,
+        }
+    }
+
+    pub fn ncols(&self) -> usize {
+        match self {
+            Self::Dense(matrix) => matrix.ncols(),
+            Self::Sparse(matrix) => matrix.ncols,
+        }
+    }
+
+    pub fn get(&self, row: usize, col: usize) -> f32 {
+        match self {
+            Self::Dense(matrix) => matrix[[row, col]],
+            Self::Sparse(matrix) => matrix.get(row, col).unwrap_or(0.0),
+        }
+    }
+
+    pub fn column_dense(&self, col: usize) -> Vec<f32> {
+        match self {
+            Self::Dense(matrix) => matrix.column(col).iter().copied().collect(),
+            Self::Sparse(matrix) => matrix.column_dense(col),
+        }
+    }
+
+    pub fn select_columns_dense(&self, cols: &[usize]) -> Array2<f32> {
+        match self {
+            Self::Dense(matrix) => {
+                let mut out = Array2::<f32>::zeros((matrix.nrows(), cols.len()));
+                for (offset, &col) in cols.iter().enumerate() {
+                    out.column_mut(offset).assign(&matrix.column(col));
+                }
+                out
+            }
+            Self::Sparse(matrix) => matrix.select_columns_dense(cols),
+        }
+    }
+
+    pub fn for_each_nonzero_in_row(&self, row: usize, mut f: impl FnMut(usize, f32)) {
+        match self {
+            Self::Dense(matrix) => {
+                for (col, value) in matrix.row(row).iter().copied().enumerate() {
+                    if value != 0.0 {
+                        f(col, value);
+                    }
+                }
+            }
+            Self::Sparse(matrix) => matrix.for_each_nonzero_in_row(row, f),
+        }
+    }
+}
+
+impl CsrMatrix {
+    pub fn get(&self, row: usize, col: usize) -> Option<f32> {
+        let start = self.indptr.get(row).copied().unwrap_or(0).max(0) as usize;
+        let end = self.indptr.get(row + 1).copied().unwrap_or(0).max(0) as usize;
+        for idx in start..end {
+            let current = self.indices[idx].max(0) as usize;
+            if current == col {
+                return self.data.get(idx).copied();
+            }
+        }
+        None
+    }
+
+    pub fn for_each_nonzero_in_row(&self, row: usize, mut f: impl FnMut(usize, f32)) {
+        let start = self.indptr.get(row).copied().unwrap_or(0).max(0) as usize;
+        let end = self.indptr.get(row + 1).copied().unwrap_or(0).max(0) as usize;
+        for idx in start..end {
+            let col = self.indices[idx].max(0) as usize;
+            f(col, self.data[idx]);
+        }
+    }
+
+    pub fn column_dense(&self, col: usize) -> Vec<f32> {
+        let mut values = vec![0.0f32; self.nrows];
+        for row in 0..self.nrows {
+            let start = self.indptr[row].max(0) as usize;
+            let end = self.indptr[row + 1].max(0) as usize;
+            for idx in start..end {
+                if self.indices[idx].max(0) as usize == col {
+                    values[row] = self.data[idx];
+                    break;
+                }
+            }
+        }
+        values
+    }
+
+    pub fn select_columns_dense(&self, cols: &[usize]) -> Array2<f32> {
+        let mut out = Array2::<f32>::zeros((self.nrows, cols.len()));
+        let lookup: HashMap<usize, usize> = cols
+            .iter()
+            .enumerate()
+            .map(|(offset, &col)| (col, offset))
+            .collect();
+        for row in 0..self.nrows {
+            let start = self.indptr[row].max(0) as usize;
+            let end = self.indptr[row + 1].max(0) as usize;
+            for idx in start..end {
+                let col = self.indices[idx].max(0) as usize;
+                if let Some(&offset) = lookup.get(&col) {
+                    out[[row, offset]] = self.data[idx];
+                }
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -437,7 +557,7 @@ fn slice_two_cols(array: Array2<f64>) -> Result<Array2<f64>> {
     Ok(array.slice(ndarray::s![.., 0..2]).to_owned())
 }
 
-fn read_expression_matrix(file: &hdf5::File, layer: Option<&str>) -> Result<Array2<f32>> {
+fn read_expression_matrix(file: &hdf5::File, layer: Option<&str>) -> Result<ExpressionMatrix> {
     let group_key = match layer {
         Some(name) => format!("layers/{name}"),
         None => "X".to_string(),
@@ -453,16 +573,27 @@ fn read_expression_matrix(file: &hdf5::File, layer: Option<&str>) -> Result<Arra
             let indices = read_usize_vec(&indices_ds)?;
             let indptr = read_usize_vec(&indptr_ds)?;
             let (nrows, ncols) = read_csr_shape(&group)?;
-            validate_csr_layout(nrows, ncols, data.len(), &indices, &indptr)?;
-            let mut dense = Array2::<f32>::zeros((nrows, ncols));
-            for row in 0..nrows {
-                let start = indptr[row];
-                let end = indptr[row + 1];
-                for idx in start..end {
-                    dense[[row, indices[idx]]] = data[idx];
+            let encoding = read_string_attr(&group, "encoding-type")
+                .unwrap_or_else(|_| "csr_matrix".to_string());
+            match encoding.as_str() {
+                "csr_matrix" => {
+                    validate_csr_layout(nrows, ncols, data.len(), &indices, &indptr)?;
+                    return Ok(ExpressionMatrix::Sparse(CsrMatrix {
+                        data,
+                        indices: indices.into_iter().map(|value| value as i32).collect(),
+                        indptr: indptr.into_iter().map(|value| value as i32).collect(),
+                        nrows,
+                        ncols,
+                    }));
                 }
+                "csc_matrix" => {
+                    validate_csc_layout(nrows, ncols, data.len(), &indices, &indptr)?;
+                    return Ok(ExpressionMatrix::Sparse(csc_to_csr_matrix(
+                        data, indices, indptr, nrows, ncols,
+                    )?));
+                }
+                other => bail!("unsupported sparse matrix encoding '{other}' in '{group_key}'"),
             }
-            return Ok(dense);
         }
     }
 
@@ -470,12 +601,54 @@ fn read_expression_matrix(file: &hdf5::File, layer: Option<&str>) -> Result<Arra
         .dataset(&group_key)
         .with_context(|| format!("opening dataset '{group_key}'"))?;
     if let Ok(array) = ds.read_2d::<f32>() {
-        return Ok(array);
+        return Ok(ExpressionMatrix::Dense(array));
     }
     if let Ok(array) = ds.read_2d::<f64>() {
-        return Ok(array.mapv(|value| value as f32));
+        return Ok(ExpressionMatrix::Dense(array.mapv(|value| value as f32)));
     }
     bail!("expression matrix '{group_key}' is not readable as f32 or f64")
+}
+
+fn csc_to_csr_matrix(
+    data: Vec<f32>,
+    indices: Vec<usize>,
+    indptr: Vec<usize>,
+    nrows: usize,
+    ncols: usize,
+) -> Result<CsrMatrix> {
+    let nnz = data.len();
+    let mut row_counts = vec![0usize; nrows];
+    for &row in &indices {
+        row_counts[row] += 1;
+    }
+
+    let mut csr_indptr_u = vec![0usize; nrows + 1];
+    for row in 0..nrows {
+        csr_indptr_u[row + 1] = csr_indptr_u[row] + row_counts[row];
+    }
+
+    let mut next = csr_indptr_u[..nrows].to_vec();
+    let mut csr_indices = vec![0i32; nnz];
+    let mut csr_data = vec![0.0f32; nnz];
+    for col in 0..ncols {
+        let start = indptr[col];
+        let end = indptr[col + 1];
+        for idx in start..end {
+            let row = indices[idx];
+            let dest = next[row];
+            csr_indices[dest] = col as i32;
+            csr_data[dest] = data[idx];
+            next[row] += 1;
+        }
+    }
+
+    Ok(CsrMatrix {
+        data: csr_data,
+        indices: csr_indices,
+        indptr: csr_indptr_u.into_iter().map(|value| value as i32).collect(),
+        nrows,
+        ncols,
+    })
 }
 
 fn read_obsm_embedding(file: &hdf5::File, key: &str) -> Result<Array2<f64>> {
@@ -498,7 +671,7 @@ fn read_obs_column(file: &hdf5::File, col: &str) -> Result<Vec<String>> {
         if let (Ok(codes_ds), Ok(categories_ds)) =
             (group.dataset("codes"), group.dataset("categories"))
         {
-            let categories = read_string_dataset(&categories_ds)?;
+            let categories = read_categorical_labels(&categories_ds)?;
             let codes = read_category_codes(&codes_ds)?;
             return decode_categorical_codes(&categories, &codes, col);
         }
@@ -518,13 +691,21 @@ fn read_obs_column(file: &hdf5::File, col: &str) -> Result<Vec<String>> {
     if let Ok(values) = ds.read_1d::<bool>() {
         return Ok(values
             .iter()
-            .map(|value| if *value { "true".to_string() } else { "false".to_string() })
+            .map(|value| {
+                if *value {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            })
             .collect());
     }
     bail!("obs/{col} is not readable as string, numeric, or bool")
 }
 
-fn read_all_obs_columns(file: &hdf5::File) -> Result<(Vec<String>, HashMap<String, ObsColumnData>)> {
+fn read_all_obs_columns(
+    file: &hdf5::File,
+) -> Result<(Vec<String>, HashMap<String, ObsColumnData>)> {
     let obs = file.group("obs").context("no 'obs' group")?;
     let index_name = resolve_index_member_name(&obs)?;
     let mut order = Vec::new();
@@ -561,7 +742,7 @@ fn read_obs_column_data(obs: &hdf5::Group, col: &str) -> Result<ObsColumnData> {
         if let (Ok(codes_ds), Ok(categories_ds)) =
             (group.dataset("codes"), group.dataset("categories"))
         {
-            let categories = read_string_dataset(&categories_ds)?;
+            let categories = read_categorical_labels(&categories_ds)?;
             let codes = read_category_codes(&codes_ds)?;
             let values = decode_categorical_codes(&categories, &codes, col)?;
             return Ok(ObsColumnData::Categorical { values, categories });
@@ -578,7 +759,13 @@ fn read_obs_column_data(obs: &hdf5::Group, col: &str) -> Result<ObsColumnData> {
     if let Ok(values) = ds.read_1d::<bool>() {
         let strings: Vec<String> = values
             .iter()
-            .map(|value| if *value { "true".to_string() } else { "false".to_string() })
+            .map(|value| {
+                if *value {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            })
             .collect();
         let categories = collect_categories_in_order(&strings);
         return Ok(ObsColumnData::Categorical {
@@ -609,6 +796,31 @@ fn read_string_dataset(ds: &hdf5::Dataset) -> Result<Vec<String>> {
     ds.read_1d::<VarLenUnicode>()
         .map(|values| values.iter().map(|value| value.to_string()).collect())
         .context("reading string dataset")
+}
+
+fn read_categorical_labels(ds: &hdf5::Dataset) -> Result<Vec<String>> {
+    if let Ok(values) = read_string_dataset(ds) {
+        return Ok(values);
+    }
+    if let Ok(values) = read_numeric_obs_values(ds) {
+        return Ok(values
+            .into_iter()
+            .map(|value| value.map_or_else(String::new, format_numeric_for_string))
+            .collect());
+    }
+    if let Ok(values) = ds.read_1d::<bool>() {
+        return Ok(values
+            .iter()
+            .map(|value| {
+                if *value {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            })
+            .collect());
+    }
+    bail!("categorical labels are not stored as string, numeric, or bool values")
 }
 
 fn read_category_codes(ds: &hdf5::Dataset) -> Result<Vec<i64>> {
@@ -652,20 +864,44 @@ fn read_f32_vec(ds: &hdf5::Dataset) -> Result<Vec<f32>> {
     if let Ok(values) = ds.read_1d::<f64>() {
         return Ok(values.iter().map(|&value| value as f32).collect());
     }
-    bail!("floating-point dataset is not f32 or f64")
+    if let Ok(values) = ds.read_1d::<i32>() {
+        return Ok(values.iter().map(|&value| value as f32).collect());
+    }
+    if let Ok(values) = ds.read_1d::<i64>() {
+        return Ok(values.iter().map(|&value| value as f32).collect());
+    }
+    if let Ok(values) = ds.read_1d::<u32>() {
+        return Ok(values.iter().map(|&value| value as f32).collect());
+    }
+    if let Ok(values) = ds.read_1d::<u64>() {
+        return Ok(values.iter().map(|&value| value as f32).collect());
+    }
+    bail!("numeric dataset is not a supported f32-compatible vector")
 }
 
 fn read_numeric_obs_values(ds: &hdf5::Dataset) -> Result<Vec<Option<f64>>> {
     if let Ok(values) = ds.read_1d::<f64>() {
         return Ok(values
             .iter()
-            .map(|value| if value.is_finite() { Some(*value) } else { None })
+            .map(|value| {
+                if value.is_finite() {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
             .collect());
     }
     if let Ok(values) = ds.read_1d::<f32>() {
         return Ok(values
             .iter()
-            .map(|value| if value.is_finite() { Some(*value as f64) } else { None })
+            .map(|value| {
+                if value.is_finite() {
+                    Some(*value as f64)
+                } else {
+                    None
+                }
+            })
             .collect());
     }
     if let Ok(values) = ds.read_1d::<i64>() {
@@ -725,8 +961,16 @@ fn read_csr_matrix_path(file: &hdf5::File, path: &str) -> Result<CsrMatrix> {
         .group(path)
         .with_context(|| format!("opening csr group '{path}'"))?;
     let data = read_f32_vec(&group.dataset("data").context("reading csr data dataset")?)?;
-    let indices_u = read_usize_vec(&group.dataset("indices").context("reading csr indices dataset")?)?;
-    let indptr_u = read_usize_vec(&group.dataset("indptr").context("reading csr indptr dataset")?)?;
+    let indices_u = read_usize_vec(
+        &group
+            .dataset("indices")
+            .context("reading csr indices dataset")?,
+    )?;
+    let indptr_u = read_usize_vec(
+        &group
+            .dataset("indptr")
+            .context("reading csr indptr dataset")?,
+    )?;
     let (nrows, ncols) = read_csr_shape(&group)?;
     validate_csr_layout(nrows, ncols, data.len(), &indices_u, &indptr_u)?;
     for &value in indices_u.iter().chain(indptr_u.iter()) {
@@ -865,6 +1109,50 @@ fn validate_csr_layout(
     Ok(())
 }
 
+fn validate_csc_layout(
+    nrows: usize,
+    ncols: usize,
+    data_len: usize,
+    indices: &[usize],
+    indptr: &[usize],
+) -> Result<()> {
+    if indptr.len() != ncols + 1 {
+        bail!(
+            "csc indptr length ({}) must equal ncols + 1 ({})",
+            indptr.len(),
+            ncols + 1
+        );
+    }
+    if indptr.first().copied() != Some(0) {
+        bail!("csc indptr must start at 0");
+    }
+    if indptr[indptr.len() - 1] != data_len {
+        bail!("csc indptr terminal value does not equal data length");
+    }
+    if indices.len() != data_len {
+        bail!(
+            "csc indices length ({}) does not match data length ({data_len})",
+            indices.len()
+        );
+    }
+    for &v in indptr {
+        if v > data_len {
+            bail!("csc indptr value {v} exceeds data length {data_len}");
+        }
+    }
+    for window in indptr.windows(2) {
+        if window[0] > window[1] {
+            bail!("csc indptr must be monotonically non-decreasing");
+        }
+    }
+    for &index in indices {
+        if index >= nrows {
+            bail!("csc row index {index} exceeds height {nrows}");
+        }
+    }
+    Ok(())
+}
+
 fn ensure_row_count(label: &str, actual: usize, expected: usize) -> Result<()> {
     if actual != expected {
         bail!("{label} row count ({actual}) does not match expected count ({expected})");
@@ -976,6 +1264,16 @@ fn set_shape_attr(group: &hdf5::Group, nrows: usize, ncols: usize) -> Result<()>
         .create("shape")
         .context("writing shape attribute")?;
     Ok(())
+}
+
+fn read_string_attr(location: &hdf5::Location, name: &str) -> Result<String> {
+    let attr = location
+        .attr(name)
+        .with_context(|| format!("reading attribute '{name}'"))?;
+    let value: VarLenUnicode = attr
+        .read_scalar()
+        .context("reading string attribute scalar")?;
+    Ok(value.to_string())
 }
 
 fn write_string_scalar(

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
+use spade::{DelaunayTriangulation, HasPosition, Point2, Triangulation};
 
 use crate::anndata::CsrMatrix;
 
@@ -9,6 +10,7 @@ use crate::anndata::CsrMatrix;
 pub enum GraphMode {
     Radius(f64),
     Knn(usize),
+    Delaunay { remove_long_links_percentile: f64 },
 }
 
 impl GraphMode {
@@ -16,6 +18,7 @@ impl GraphMode {
         match self {
             Self::Radius(_) => "radius",
             Self::Knn(_) => "knn",
+            Self::Delaunay { .. } => "delaunay",
         }
     }
 }
@@ -49,6 +52,20 @@ impl PointDistance for IndexedPoint {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexedVertex {
+    position: Point2<f64>,
+    global_index: usize,
+}
+
+impl HasPosition for IndexedVertex {
+    type Scalar = f64;
+
+    fn position(&self) -> Point2<Self::Scalar> {
+        self.position
+    }
+}
+
 pub fn build_spatial_graph(
     coordinates: &ndarray::Array2<f64>,
     groups: &[String],
@@ -64,13 +81,7 @@ pub fn build_spatial_graph(
             groups.len()
         );
     }
-    match mode {
-        GraphMode::Radius(radius) if !radius.is_finite() || radius <= 0.0 => {
-            bail!("radius must be a finite value > 0")
-        }
-        GraphMode::Knn(k) if k == 0 => bail!("k must be greater than 0"),
-        _ => {}
-    }
+    validate_graph_mode(&mode)?;
 
     let coords: Vec<[f64; 2]> = coordinates
         .rows()
@@ -89,6 +100,12 @@ pub fn build_spatial_graph(
     let mut undirected: HashMap<(usize, usize), f32> = HashMap::new();
     for indices in grouped_indices.values() {
         build_group_edges(indices, &coords, &mode, &mut undirected)?;
+    }
+    if let GraphMode::Delaunay {
+        remove_long_links_percentile,
+    } = &mode
+    {
+        trim_long_links(&mut undirected, *remove_long_links_percentile);
     }
 
     let mut neighbors = vec![Vec::<(usize, f32)>::new(); coords.len()];
@@ -111,6 +128,23 @@ pub fn build_spatial_graph(
     })
 }
 
+fn validate_graph_mode(mode: &GraphMode) -> Result<()> {
+    match mode {
+        GraphMode::Radius(radius) if !radius.is_finite() || *radius <= 0.0 => {
+            bail!("radius must be a finite value > 0")
+        }
+        GraphMode::Knn(k) if *k == 0 => bail!("k must be greater than 0"),
+        GraphMode::Delaunay {
+            remove_long_links_percentile,
+        } if !remove_long_links_percentile.is_finite()
+            || !(0.0..=100.0).contains(remove_long_links_percentile) =>
+        {
+            bail!("remove-long-links-percentile must be a finite value between 0 and 100")
+        }
+        _ => Ok(()),
+    }
+}
+
 fn build_group_edges(
     indices: &[usize],
     coordinates: &[[f64; 2]],
@@ -121,6 +155,19 @@ fn build_group_edges(
         return Ok(());
     }
 
+    match mode {
+        GraphMode::Radius(radius) => build_radius_edges(indices, coordinates, *radius, target),
+        GraphMode::Knn(k) => build_knn_edges(indices, coordinates, *k, target),
+        GraphMode::Delaunay { .. } => build_delaunay_edges(indices, coordinates, target),
+    }
+}
+
+fn build_radius_edges(
+    indices: &[usize],
+    coordinates: &[[f64; 2]],
+    radius: f64,
+    target: &mut HashMap<(usize, usize), f32>,
+) -> Result<()> {
     let points: Vec<IndexedPoint> = indices
         .iter()
         .enumerate()
@@ -130,51 +177,128 @@ fn build_group_edges(
         })
         .collect();
     let tree = RTree::bulk_load(points);
-
-    match mode {
-        GraphMode::Radius(radius) => {
-            let radius_sq = radius * radius;
-            for (local_i, &global_i) in indices.iter().enumerate() {
-                let coord = coordinates[global_i];
-                for point in tree.locate_within_distance(coord, radius_sq) {
-                    if point.local_index <= local_i {
-                        continue;
-                    }
-                    let global_j = indices[point.local_index];
-                    let distance = point.distance_2(&coord).sqrt() as f32;
-                    target.insert((global_i, global_j), distance);
-                }
+    let radius_sq = radius * radius;
+    for (local_i, &global_i) in indices.iter().enumerate() {
+        let coord = coordinates[global_i];
+        for point in tree.locate_within_distance(coord, radius_sq) {
+            if point.local_index <= local_i {
+                continue;
             }
-        }
-        GraphMode::Knn(k) => {
-            for (local_i, &global_i) in indices.iter().enumerate() {
-                let coord = coordinates[global_i];
-                for (point, dist_sq) in tree
-                    .nearest_neighbor_iter_with_distance_2(&coord)
-                    .filter(|(point, _)| point.local_index != local_i)
-                    .take(*k)
-                {
-                    let global_j = indices[point.local_index];
-                    let pair = if global_i < global_j {
-                        (global_i, global_j)
-                    } else {
-                        (global_j, global_i)
-                    };
-                    let distance = dist_sq.sqrt() as f32;
-                    target
-                        .entry(pair)
-                        .and_modify(|existing| {
-                            if distance < *existing {
-                                *existing = distance;
-                            }
-                        })
-                        .or_insert(distance);
-                }
-            }
+            let global_j = indices[point.local_index];
+            let distance = point.distance_2(&coord).sqrt() as f32;
+            target.insert((global_i, global_j), distance);
         }
     }
-
     Ok(())
+}
+
+fn build_knn_edges(
+    indices: &[usize],
+    coordinates: &[[f64; 2]],
+    k: usize,
+    target: &mut HashMap<(usize, usize), f32>,
+) -> Result<()> {
+    let points: Vec<IndexedPoint> = indices
+        .iter()
+        .enumerate()
+        .map(|(local_index, &global_index)| IndexedPoint {
+            coords: coordinates[global_index],
+            local_index,
+        })
+        .collect();
+    let tree = RTree::bulk_load(points);
+    for (local_i, &global_i) in indices.iter().enumerate() {
+        let coord = coordinates[global_i];
+        for (point, dist_sq) in tree
+            .nearest_neighbor_iter_with_distance_2(&coord)
+            .filter(|(point, _)| point.local_index != local_i)
+            .take(k)
+        {
+            let global_j = indices[point.local_index];
+            let pair = if global_i < global_j {
+                (global_i, global_j)
+            } else {
+                (global_j, global_i)
+            };
+            let distance = dist_sq.sqrt() as f32;
+            target
+                .entry(pair)
+                .and_modify(|existing| {
+                    if distance < *existing {
+                        *existing = distance;
+                    }
+                })
+                .or_insert(distance);
+        }
+    }
+    Ok(())
+}
+
+fn build_delaunay_edges(
+    indices: &[usize],
+    coordinates: &[[f64; 2]],
+    target: &mut HashMap<(usize, usize), f32>,
+) -> Result<()> {
+    let vertices: Vec<IndexedVertex> = indices
+        .iter()
+        .map(|&global_index| IndexedVertex {
+            position: Point2::new(coordinates[global_index][0], coordinates[global_index][1]),
+            global_index,
+        })
+        .collect();
+    let triangulation = DelaunayTriangulation::<IndexedVertex>::bulk_load(vertices)?;
+    for edge in triangulation.undirected_edges() {
+        let [from_vertex, to_vertex] = edge.vertices();
+        let from = from_vertex.data().global_index;
+        let to = to_vertex.data().global_index;
+        let pair = if from < to { (from, to) } else { (to, from) };
+        let [from_pos, to_pos] = edge.positions();
+        let distance = from_pos.distance_2(to_pos).sqrt() as f32;
+        target
+            .entry(pair)
+            .and_modify(|existing| {
+                if distance < *existing {
+                    *existing = distance;
+                }
+            })
+            .or_insert(distance);
+    }
+    Ok(())
+}
+
+fn trim_long_links(edges: &mut HashMap<(usize, usize), f32>, percentile: f64) {
+    if edges.is_empty() {
+        return;
+    }
+
+    let mut distances: Vec<f32> = edges
+        .values()
+        .copied()
+        .filter(|value| *value > 0.0)
+        .collect();
+    if distances.is_empty() {
+        return;
+    }
+    distances.sort_by(|left, right| left.total_cmp(right));
+    let threshold = percentile_value(&distances, percentile);
+    edges.retain(|_, distance| *distance <= threshold);
+}
+
+fn percentile_value(sorted: &[f32], percentile: f64) -> f32 {
+    debug_assert!(!sorted.is_empty());
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+
+    let clamped = percentile.clamp(0.0, 100.0);
+    let rank = (clamped / 100.0) * ((sorted.len() - 1) as f64);
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+    let weight = (rank - lower as f64) as f32;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * weight
 }
 
 fn csr_from_neighbors(
@@ -223,5 +347,72 @@ mod tests {
         assert_eq!(graph.n_undirected_edges, 2);
         assert_eq!(graph.neighbors[0].len(), 1);
         assert_eq!(graph.neighbors[2].len(), 1);
+    }
+
+    #[test]
+    fn delaunay_graph_respects_group_boundaries() {
+        let coords = arr2(&[
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.5, 1.0],
+            [10.0, 0.0],
+            [11.0, 0.0],
+            [10.5, 1.0],
+        ]);
+        let groups = vec![
+            "A".to_string(),
+            "A".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "B".to_string(),
+            "B".to_string(),
+        ];
+        let graph = build_spatial_graph(
+            &coords,
+            &groups,
+            GraphMode::Delaunay {
+                remove_long_links_percentile: 100.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(graph.n_undirected_edges, 6);
+        assert!(graph.neighbors[0].iter().all(|(idx, _)| *idx < 3));
+        assert!(graph.neighbors[3].iter().all(|(idx, _)| *idx >= 3));
+    }
+
+    #[test]
+    fn delaunay_long_link_trim_removes_percentile_tail() {
+        let coords = arr2(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [1.5, 100.0]]);
+        let groups = vec!["A".to_string(); coords.nrows()];
+
+        let full = build_spatial_graph(
+            &coords,
+            &groups,
+            GraphMode::Delaunay {
+                remove_long_links_percentile: 100.0,
+            },
+        )
+        .unwrap();
+        let trimmed = build_spatial_graph(
+            &coords,
+            &groups,
+            GraphMode::Delaunay {
+                remove_long_links_percentile: 80.0,
+            },
+        )
+        .unwrap();
+
+        assert!(trimmed.n_undirected_edges < full.n_undirected_edges);
+        let max_full = full
+            .neighbors
+            .iter()
+            .flat_map(|row| row.iter().map(|(_, distance)| *distance))
+            .fold(0.0f32, f32::max);
+        let max_trimmed = trimmed
+            .neighbors
+            .iter()
+            .flat_map(|row| row.iter().map(|(_, distance)| *distance))
+            .fold(0.0f32, f32::max);
+        assert!(max_trimmed < max_full);
     }
 }

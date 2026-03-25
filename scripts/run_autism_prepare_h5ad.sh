@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT="${1:-/Users/chrislangseth/Downloads/baloMS_indep_clust_balo_MANA_balo_annot.h5ad}"
-OUTPUT_H5AD="${2:-/tmp/baloMS_companion.ready.h5ad}"
+INPUT="${1:-/Volumes/processing2/autism/autism_concatenated_filtered_sparse.h5ad}"
+OUTPUT_H5AD="${2:-/Volumes/processing2/autism/autism_concatenated_filtered_sparse.companion.ready.h5ad}"
 
 cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \
   --delaunay \
-  --groupby sample_id \
-  --composition-cell-type leiden_2_names_sub \
-  --normalize-from layer:counts \
+  --groupby source_file \
+  --composition-cell-type tangram_cell_type \
+  --skip-normalized-layer \
   --skip-aggregation \
   --overwrite-derived \
   --persist-analytics-in-h5ad \
-  --viewer-analytics-columns leiden_2_names_sub,leiden_0.5 \
+  --viewer-analytics-columns tangram_cell_type,anatomical_region \
   --skip-viewer-interaction-markers \
   --viewer-cluster-de-method t-test
 

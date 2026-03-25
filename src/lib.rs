@@ -154,19 +154,17 @@ pub fn prepare(config: &PrepareConfig) -> Result<PrepareSummary> {
         })
     };
 
-    let aggregated = aggregate_matrix
-        .as_ref()
-        .map(|matrix| {
-            let stage = reporter.stage("Aggregating neighbor features");
-            let aggregated = aggregate_neighbors(&graph.neighbors, matrix);
-            stage.finish(format!(
-                "shape={}x{}, source={}",
-                aggregated.nrows(),
-                aggregated.ncols(),
-                config.aggregate_from.as_cli_value()
-            ));
-            aggregated
-        });
+    let aggregated = aggregate_matrix.as_ref().map(|matrix| {
+        let stage = reporter.stage("Aggregating neighbor features");
+        let aggregated = aggregate_neighbors(&graph.neighbors, matrix);
+        stage.finish(format!(
+            "shape={}x{}, source={}",
+            aggregated.nrows(),
+            aggregated.ncols(),
+            config.aggregate_from.as_cli_value()
+        ));
+        aggregated
+    });
 
     let composition = if let Some(cell_type_col) = &config.composition_cell_type {
         let stage = reporter.stage(format!(
@@ -349,12 +347,20 @@ pub fn prepare(config: &PrepareConfig) -> Result<PrepareSummary> {
     metadata
         .numbers
         .insert("n_edges".to_string(), graph.n_undirected_edges as f64);
-    match config.graph_mode {
+    match &config.graph_mode {
         GraphMode::Radius(radius) => {
-            metadata.numbers.insert("radius".to_string(), radius);
+            metadata.numbers.insert("radius".to_string(), *radius);
         }
         GraphMode::Knn(k) => {
-            metadata.numbers.insert("k".to_string(), k as f64);
+            metadata.numbers.insert("k".to_string(), *k as f64);
+        }
+        GraphMode::Delaunay {
+            remove_long_links_percentile,
+        } => {
+            metadata.numbers.insert(
+                "remove_long_links_percentile".to_string(),
+                *remove_long_links_percentile,
+            );
         }
     }
     if let Some(result) = &nmf_result {
@@ -381,11 +387,8 @@ pub fn prepare(config: &PrepareConfig) -> Result<PrepareSummary> {
 
     let companion_analytics = if let Some(viewer_config) = &config.viewer_precompute {
         let stage = reporter.stage("Computing companion analytics");
-        let analytics = compute_companion_analytics(
-            &config.output,
-            config.groupby.as_deref(),
-            viewer_config,
-        )?;
+        let analytics =
+            compute_companion_analytics(&config.output, config.groupby.as_deref(), viewer_config)?;
         stage.finish(format!(
             "columns={}, interaction_markers={}",
             analytics.analytics_columns.len(),
@@ -628,6 +631,37 @@ mod tests {
         });
     }
 
+    #[test]
+    fn prepare_reads_csc_integer_counts_layer() {
+        with_temp_paths("prepare-csc-counts", |input, output| {
+            create_test_h5ad(input);
+            let config = PrepareConfig {
+                input: input.to_path_buf(),
+                output: output.to_path_buf(),
+                graph_mode: GraphMode::Radius(1.5),
+                groupby: Some("sample".to_string()),
+                composition_cell_type: Some("cell_type".to_string()),
+                normalize_from: MatrixSource::Layer("counts".to_string()),
+                skip_normalized_layer: false,
+                target_sum: 10_000.0,
+                log1p: true,
+                skip_aggregation: true,
+                aggregate_from: MatrixSource::Normalized,
+                nmf_components: None,
+                nmf_max_iter: 25,
+                nmf_seed: 7,
+                overwrite_derived: true,
+                viewer_precompute: None,
+            };
+
+            let summary = prepare(&config).unwrap();
+            assert_eq!(summary.n_cells, 4);
+
+            let file = hdf5::File::open(output).unwrap();
+            assert!(file.group("layers").unwrap().link_exists("normalized"));
+        });
+    }
+
     fn create_test_h5ad(path: &Path) {
         let file = hdf5::File::create(path).unwrap();
 
@@ -635,6 +669,7 @@ mod tests {
         write_string_dataset(&obs, "_index", &["cell1", "cell2", "cell3", "cell4"]);
         write_string_dataset(&obs, "sample", &["A", "A", "B", "B"]);
         write_string_dataset(&obs, "cell_type", &["t1", "t2", "t1", "t2"]);
+        write_categorical_i64_dataset(&obs, "cluster_id", &[0, 1, 0, 1], &[10, 20]);
 
         let var = file.create_group("var").unwrap();
         write_string_dataset(&var, "_index", &["gene1", "gene2", "gene3"]);
@@ -648,6 +683,17 @@ mod tests {
             ]))
             .create("X")
             .unwrap();
+
+        let layers = file.create_group("layers").unwrap();
+        write_csc_u32(
+            &layers,
+            "counts",
+            &[3, 2, 2, 3, 1, 1, 1],
+            &[0, 2, 1, 3, 0, 1, 3],
+            &[0, 2, 4, 7],
+            4,
+            3,
+        );
 
         let obsm = file.create_group("obsm").unwrap();
         obsm.new_dataset_builder()
@@ -670,6 +716,71 @@ mod tests {
             .new_dataset_builder()
             .with_data(&encoded)
             .create(name)
+            .unwrap();
+    }
+
+    fn write_csc_u32(
+        parent: &hdf5::Group,
+        name: &str,
+        data: &[u32],
+        indices: &[i32],
+        indptr: &[i32],
+        nrows: usize,
+        ncols: usize,
+    ) {
+        let group = parent.create_group(name).unwrap();
+        let enc = VarLenUnicode::from_str("csc_matrix").unwrap();
+        let ver = VarLenUnicode::from_str("0.1.0").unwrap();
+        let attr = group
+            .new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("encoding-type")
+            .unwrap();
+        attr.write_scalar(&enc).unwrap();
+        let attr = group
+            .new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("encoding-version")
+            .unwrap();
+        attr.write_scalar(&ver).unwrap();
+        group
+            .new_attr_builder()
+            .with_data(&[nrows as i64, ncols as i64])
+            .create("shape")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(data)
+            .create("data")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(indices)
+            .create("indices")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(indptr)
+            .create("indptr")
+            .unwrap();
+    }
+
+    fn write_categorical_i64_dataset(
+        parent: &hdf5::Group,
+        name: &str,
+        codes: &[i64],
+        categories: &[i64],
+    ) {
+        let group = parent.create_group(name).unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(codes)
+            .create("codes")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(categories)
+            .create("categories")
             .unwrap();
     }
 

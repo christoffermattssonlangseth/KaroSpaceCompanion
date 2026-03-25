@@ -34,6 +34,12 @@ struct PrepareArgs {
     #[arg(long, conflicts_with = "radius")]
     k: Option<usize>,
 
+    #[arg(long, conflicts_with_all = ["radius", "k"])]
+    delaunay: bool,
+
+    #[arg(long = "remove-long-links-percentile", default_value_t = 99.0)]
+    remove_long_links_percentile: f64,
+
     #[arg(long)]
     groupby: Option<String>,
 
@@ -117,12 +123,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Prepare(args) => {
-            let graph_mode = match (args.radius, args.k) {
-                (Some(radius), None) => GraphMode::Radius(radius),
-                (None, Some(k)) => GraphMode::Knn(k),
-                _ => anyhow::bail!("exactly one of --radius or --k must be provided"),
+            let graph_mode = match (args.radius, args.k, args.delaunay) {
+                (Some(radius), None, false) => GraphMode::Radius(radius),
+                (None, Some(k), false) => GraphMode::Knn(k),
+                (None, None, true) => GraphMode::Delaunay {
+                    remove_long_links_percentile: args.remove_long_links_percentile,
+                },
+                _ => anyhow::bail!("exactly one of --radius, --k, or --delaunay must be provided"),
             };
-            let viewer_precompute = if args.viewer_json.is_some() || args.persist_analytics_in_h5ad {
+            let viewer_precompute = if args.viewer_json.is_some() || args.persist_analytics_in_h5ad
+            {
                 Some(ViewerPrecomputeConfig {
                     output_json: args.viewer_json,
                     initial_color: args.initial_color,
