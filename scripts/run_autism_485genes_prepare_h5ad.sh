@@ -14,6 +14,7 @@ cargo run --release --offline -- prepare "$INPUT" \
   --overwrite-derived \
   --persist-analytics-in-h5ad \
   --viewer-analytics-columns tangram_cell_type,anatomical_region \
+  --viewer-neighbor-permutations 5 \
   --skip-viewer-interaction-markers \
   --viewer-cluster-de-method t-test
 

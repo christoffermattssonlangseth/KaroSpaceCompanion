@@ -91,6 +91,9 @@ struct PrepareArgs {
     #[arg(long = "viewer-analytics-columns")]
     viewer_analytics_columns: Option<String>,
 
+    #[arg(long = "viewer-neighbor-permutations")]
+    viewer_neighbor_permutations: Option<usize>,
+
     #[arg(long = "skip-viewer-interaction-markers", default_value_t = false)]
     skip_viewer_interaction_markers: bool,
 
@@ -152,6 +155,7 @@ fn main() -> Result<()> {
                     cluster_de_method: DeMethod::parse(&args.viewer_cluster_de_method)?,
                     cluster_de_top_n: 20,
                     cluster_de_min_cells: 20,
+                    neighbor_stats_permutations: args.viewer_neighbor_permutations,
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::parse(&args.viewer_interaction_method)?,
                     interaction_markers_gene_limit: args.viewer_interaction_gene_limit,

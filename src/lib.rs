@@ -604,6 +604,7 @@ mod tests {
                     cluster_de_method: DeMethod::TTest,
                     cluster_de_top_n: 2,
                     cluster_de_min_cells: 1,
+                    neighbor_stats_permutations: Some(4),
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::TTest,
                     interaction_markers_gene_limit: 2,

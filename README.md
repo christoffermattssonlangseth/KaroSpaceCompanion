@@ -24,6 +24,7 @@ cargo run --release --offline -- prepare input.h5ad \
   --initial-color cell_type \
   --viewer-genes EPCAM,KRT19,COL1A1 \
   --viewer-analytics-columns cell_type \
+  --viewer-neighbor-permutations 20 \
   --skip-viewer-interaction-markers \
   --viewer-cluster-de-method t-test \
   --viewer-interaction-method t-test
@@ -74,6 +75,8 @@ Notes:
 - Omitting `--viewer-genes` exports all genes into the viewer JSON. That is complete, but it can become very large on real datasets.
 - Dense section arrays can be packed to base64 for coordinates, colors, UMAP, and edges. Sparse gene sections can be packed with `ib64`/`vb64`.
 - `--viewer-analytics-columns` limits the expensive precomputations (`cluster_de`, `neighbor_stats`, `interaction_markers`, `marker_genes`, `cluster_gene_means`) to the categorical columns you name. This is the practical way to run large datasets.
+- `neighbor_stats` z-scores come from label permutations. By default, datasets with at least `200,000` cells use `0` permutations, so `zscore` is omitted to avoid a very expensive pass.
+- `--viewer-neighbor-permutations N` overrides that auto behavior. Any positive `N` forces z-score computation, but runtime can increase sharply on million-cell datasets.
 - `--skip-viewer-interaction-markers` disables the contact-vs-noncontact DE block entirely. For large datasets this is often the right default.
 - `--viewer-cluster-de-method` and `--viewer-interaction-method` support `t-test` and `wilcoxon`. `t-test` is the fast path for large datasets.
 - `--viewer-interaction-gene-limit` restricts the gene universe scanned for interaction markers to the top variable genes, which keeps large exports tractable.

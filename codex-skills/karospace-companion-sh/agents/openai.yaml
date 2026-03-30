@@ -1,0 +1,7 @@
+interface:
+  display_name: "KaroSpace Companion Sh"
+  short_description: "Generate KaroSpace runner scripts"
+  default_prompt: "Use $karospace-companion-sh to create a KaroSpaceCompanion dataset runner."
+
+policy:
+  allow_implicit_invocation: true

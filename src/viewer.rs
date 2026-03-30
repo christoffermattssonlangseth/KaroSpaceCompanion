@@ -55,6 +55,7 @@ pub struct ViewerPrecomputeConfig {
     pub cluster_de_method: DeMethod,
     pub cluster_de_top_n: usize,
     pub cluster_de_min_cells: usize,
+    pub neighbor_stats_permutations: Option<usize>,
     pub neighbor_stats_seed: u64,
     pub interaction_markers_method: DeMethod,
     pub interaction_markers_gene_limit: usize,
@@ -438,11 +439,13 @@ fn compute_companion_analytics_from_loaded(
         Some(reporter),
     );
 
+    let neighbor_stats_permutations =
+        resolve_neighbor_stats_permutations(config, adata.obs_names.len());
     let (neighbor_stats, neighbor_contexts) = if let Some(graph) = &adata.graph {
         compute_neighbor_stats(
             graph,
             &analytics_columns,
-            auto_neighbor_permutations(adata.obs_names.len()),
+            neighbor_stats_permutations,
             config.neighbor_stats_seed,
             Some(reporter),
         )
@@ -2205,6 +2208,12 @@ fn auto_neighbor_permutations(n_cells: usize) -> usize {
     }
 }
 
+fn resolve_neighbor_stats_permutations(config: &ViewerPrecomputeConfig, n_cells: usize) -> usize {
+    config
+        .neighbor_stats_permutations
+        .unwrap_or_else(|| auto_neighbor_permutations(n_cells))
+}
+
 fn categorical_codes(values: &[String], categories: &[String]) -> Vec<Option<usize>> {
     let lookup: HashMap<&str, usize> = categories
         .iter()
@@ -2429,8 +2438,8 @@ mod tests {
     use ndarray::{arr2, Array2};
 
     use super::{
-        compute_companion_analytics, export_viewer_precompute_json, DeMethod, GeneEncodingMode,
-        ViewerPrecomputeConfig,
+        compute_companion_analytics, export_viewer_precompute_json,
+        resolve_neighbor_stats_permutations, DeMethod, GeneEncodingMode, ViewerPrecomputeConfig,
     };
     use serde_json::Value;
 
@@ -2457,6 +2466,7 @@ mod tests {
                 cluster_de_method: DeMethod::TTest,
                 cluster_de_top_n: 3,
                 cluster_de_min_cells: 1,
+                neighbor_stats_permutations: Some(4),
                 neighbor_stats_seed: 0,
                 interaction_markers_method: DeMethod::TTest,
                 interaction_markers_gene_limit: 3,
@@ -2513,6 +2523,7 @@ mod tests {
                     cluster_de_method: DeMethod::TTest,
                     cluster_de_top_n: 3,
                     cluster_de_min_cells: 1,
+                    neighbor_stats_permutations: Some(4),
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::TTest,
                     interaction_markers_gene_limit: 3,
@@ -2527,6 +2538,53 @@ mod tests {
                 let gene_correlations = analytics.gene_correlations.as_object().unwrap();
                 assert_eq!(gene_correlations.len(), 200);
             },
+        );
+    }
+
+    #[test]
+    fn neighbor_stats_permutations_override_auto_cutoff() {
+        let config = ViewerPrecomputeConfig {
+            output_json: None,
+            initial_color: None,
+            genes: None,
+            analytics_columns: None,
+            include_interaction_markers: false,
+            gene_encoding: GeneEncodingMode::Auto,
+            gene_sparse_zero_threshold: 0.8,
+            pack_arrays: false,
+            pack_arrays_min_len: 1024,
+            gene_sparse_pack_min_nnz: 256,
+            gene_correlation_top_n: 0,
+            gene_correlation_n_genes: 0,
+            cluster_means_n_genes: 0,
+            spatial_variable_genes_n: 0,
+            marker_genes_top_n: 0,
+            cluster_de_method: DeMethod::TTest,
+            cluster_de_top_n: 0,
+            cluster_de_min_cells: 0,
+            neighbor_stats_permutations: Some(5),
+            neighbor_stats_seed: 0,
+            interaction_markers_method: DeMethod::TTest,
+            interaction_markers_gene_limit: 0,
+            interaction_markers_top_targets: 0,
+            interaction_markers_top_genes: 0,
+            interaction_markers_min_cells: 0,
+            interaction_markers_min_neighbors: 0,
+        };
+
+        assert_eq!(resolve_neighbor_stats_permutations(&config, 500_000), 5);
+
+        let auto_config = ViewerPrecomputeConfig {
+            neighbor_stats_permutations: None,
+            ..config
+        };
+        assert_eq!(
+            resolve_neighbor_stats_permutations(&auto_config, 500_000),
+            0
+        );
+        assert_eq!(
+            resolve_neighbor_stats_permutations(&auto_config, 10_000),
+            20
         );
     }
 
