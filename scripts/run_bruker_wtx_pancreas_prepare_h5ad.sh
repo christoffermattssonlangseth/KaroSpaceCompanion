@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT="${1:-/Volumes/processing2/bruker-wtx-skin/bruker-wtx-skin.h5ad}"
-OUTPUT_H5AD="${2:-/Volumes/processing2/bruker-wtx-skin/bruker-wtx-skin.companion.ready.h5ad}"
+INPUT="${1:-/Volumes/processing2/bruker-wtx-pancreas/bruker-wtx-pancreas.h5ad}"
+OUTPUT_H5AD="${2:-/Volumes/processing2/bruker-wtx-pancreas/bruker-wtx-pancreas.companion.ready.h5ad}"
 
 cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \

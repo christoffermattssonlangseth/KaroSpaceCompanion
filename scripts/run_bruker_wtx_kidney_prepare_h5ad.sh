@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT="${1:-/Volumes/processing2/bruker-wtx-skin/bruker-wtx-skin.h5ad}"
-OUTPUT_H5AD="${2:-/Volumes/processing2/bruker-wtx-skin/bruker-wtx-skin.companion.ready.h5ad}"
+INPUT="${1:-/Volumes/processing2/bruker-wtx-kidney/bruker-wtx-kidney.h5ad}"
+OUTPUT_H5AD="${2:-/Volumes/processing2/bruker-wtx-kidney/bruker-wtx-kidney.companion.ready.h5ad}"
 
 cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \
   --delaunay \
-  --groupby dataset_id \
+  --groupby fov \
   --composition-cell-type cluster \
   --skip-normalized-layer \
   --skip-aggregation \
