@@ -521,33 +521,47 @@ fn read_index_column(group: &hdf5::Group, label: &str) -> Result<Vec<String>> {
     if let Ok(ds) = group.dataset("_index") {
         return read_string_dataset(&ds).with_context(|| format!("reading {label}/_index"));
     }
+    if let Ok(string_group) = group.group("_index") {
+        return read_string_group(&string_group)
+            .with_context(|| format!("reading {label}/_index"));
+    }
     if let Ok(ds) = group.dataset("index") {
         return read_string_dataset(&ds).with_context(|| format!("reading {label}/index"));
     }
+    if let Ok(string_group) = group.group("index") {
+        return read_string_group(&string_group).with_context(|| format!("reading {label}/index"));
+    }
     if let Ok(attr) = group.attr("_index") {
         let name: VarLenUnicode = attr.read_scalar().context("reading _index attribute")?;
-        let ds = group
-            .dataset(name.as_str())
-            .with_context(|| format!("opening {label}/{}", name.as_str()))?;
-        return read_string_dataset(&ds);
+        if let Ok(ds) = group.dataset(name.as_str()) {
+            return read_string_dataset(&ds);
+        }
+        if let Ok(string_group) = group.group(name.as_str()) {
+            return read_string_group(&string_group);
+        }
+        bail!("opening {label}/{}", name.as_str());
     }
     bail!("could not locate {label} index")
 }
 
 fn read_spatial(file: &hdf5::File) -> Result<Array2<f64>> {
-    let obsm = file.group("obsm").context("no 'obsm' group")?;
-    for key in ["spatial", "X_spatial"] {
-        if let Ok(ds) = obsm.dataset(key) {
-            if let Ok(array) = ds.read_2d::<f64>() {
-                return slice_two_cols(array);
+    if let Ok(obsm) = file.group("obsm") {
+        for key in ["spatial", "X_spatial"] {
+            if let Ok(ds) = obsm.dataset(key) {
+                if let Ok(array) = ds.read_2d::<f64>() {
+                    return slice_two_cols(array);
+                }
+                if let Ok(array) = ds.read_2d::<f32>() {
+                    return slice_two_cols(array.mapv(|value| value as f64));
+                }
+                bail!("obsm/{key} is not a numeric matrix");
             }
-            if let Ok(array) = ds.read_2d::<f32>() {
-                return slice_two_cols(array.mapv(|value| value as f64));
-            }
-            bail!("obsm/{key} is not a numeric matrix");
         }
     }
-    bail!("no spatial coordinates found in obsm/spatial or obsm/X_spatial")
+    if let Some(coords) = read_spatial_from_obs(file)? {
+        return Ok(coords);
+    }
+    bail!("no spatial coordinates found in obsm/spatial, obsm/X_spatial, or fallback obs coordinate columns")
 }
 
 fn slice_two_cols(array: Array2<f64>) -> Result<Array2<f64>> {
@@ -555,6 +569,68 @@ fn slice_two_cols(array: Array2<f64>) -> Result<Array2<f64>> {
         bail!("spatial coordinate matrix must have at least 2 columns");
     }
     Ok(array.slice(ndarray::s![.., 0..2]).to_owned())
+}
+
+fn read_spatial_from_obs(file: &hdf5::File) -> Result<Option<Array2<f64>>> {
+    for (x_key, y_key) in [
+        ("array_col", "array_row"),
+        ("pxl_col_in_fullres", "pxl_row_in_fullres"),
+        ("x", "y"),
+    ] {
+        let Some(x_values) = read_obs_numeric_column(file, x_key)? else {
+            continue;
+        };
+        let Some(y_values) = read_obs_numeric_column(file, y_key)? else {
+            continue;
+        };
+        if x_values.len() != y_values.len() {
+            bail!("obs/{x_key} and obs/{y_key} length mismatch");
+        }
+        let mut coords = Array2::<f64>::zeros((x_values.len(), 2));
+        for (idx, (x, y)) in x_values.into_iter().zip(y_values).enumerate() {
+            coords[[idx, 0]] = x;
+            coords[[idx, 1]] = y;
+        }
+        return Ok(Some(coords));
+    }
+    Ok(None)
+}
+
+fn read_obs_numeric_column(file: &hdf5::File, col: &str) -> Result<Option<Vec<f64>>> {
+    let obs = file.group("obs").context("no 'obs' group")?;
+    if let Ok(group) = obs.group(col) {
+        if let Ok(values) = read_nullable_numeric_group(&group) {
+            return Ok(Some(
+                values
+                    .into_iter()
+                    .map(|value| value.unwrap_or(f64::NAN))
+                    .collect(),
+            ));
+        }
+        if let Ok(ds) = single_member_dataset(&group) {
+            if let Ok(values) = read_numeric_obs_values(&ds) {
+                return Ok(Some(
+                    values
+                        .into_iter()
+                        .map(|value| value.unwrap_or(f64::NAN))
+                        .collect(),
+                ));
+            }
+        }
+        return Ok(None);
+    }
+    if let Ok(ds) = obs.dataset(col) {
+        if let Ok(values) = read_numeric_obs_values(&ds) {
+            return Ok(Some(
+                values
+                    .into_iter()
+                    .map(|value| value.unwrap_or(f64::NAN))
+                    .collect(),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(None)
 }
 
 fn read_expression_matrix(file: &hdf5::File, layer: Option<&str>) -> Result<ExpressionMatrix> {
@@ -668,12 +744,22 @@ fn read_obsm_embedding(file: &hdf5::File, key: &str) -> Result<Array2<f64>> {
 fn read_obs_column(file: &hdf5::File, col: &str) -> Result<Vec<String>> {
     let obs = file.group("obs").context("no 'obs' group")?;
     if let Ok(group) = obs.group(col) {
-        if let (Ok(codes_ds), Ok(categories_ds)) =
-            (group.dataset("codes"), group.dataset("categories"))
-        {
-            let categories = read_categorical_labels(&categories_ds)?;
+        if let Ok(codes_ds) = group.dataset("codes") {
+            let categories = read_categorical_labels_from_group(&group)?;
             let codes = read_category_codes(&codes_ds)?;
             return decode_categorical_codes(&categories, &codes, col);
+        }
+        if let Ok(values) = read_single_dataset_group_as_strings(&group) {
+            return Ok(values);
+        }
+        if let Ok(values) = read_string_group(&group) {
+            return Ok(values);
+        }
+        if let Ok(values) = read_nullable_numeric_group(&group) {
+            return Ok(values
+                .into_iter()
+                .map(|value| value.map_or_else(String::new, format_numeric_for_string))
+                .collect());
         }
     }
     let ds = obs
@@ -739,13 +825,21 @@ fn resolve_index_member_name(group: &hdf5::Group) -> Result<Option<String>> {
 
 fn read_obs_column_data(obs: &hdf5::Group, col: &str) -> Result<ObsColumnData> {
     if let Ok(group) = obs.group(col) {
-        if let (Ok(codes_ds), Ok(categories_ds)) =
-            (group.dataset("codes"), group.dataset("categories"))
-        {
-            let categories = read_categorical_labels(&categories_ds)?;
+        if let Ok(codes_ds) = group.dataset("codes") {
+            let categories = read_categorical_labels_from_group(&group)?;
             let codes = read_category_codes(&codes_ds)?;
             let values = decode_categorical_codes(&categories, &codes, col)?;
             return Ok(ObsColumnData::Categorical { values, categories });
+        }
+        if let Ok(column) = read_single_dataset_group_column(&group) {
+            return Ok(column);
+        }
+        if let Ok(values) = read_string_group(&group) {
+            let categories = collect_categories_in_order(&values);
+            return Ok(ObsColumnData::Categorical { values, categories });
+        }
+        if let Ok(values) = read_nullable_numeric_group(&group) {
+            return Ok(ObsColumnData::Numeric { values });
         }
     }
 
@@ -779,6 +873,75 @@ fn read_obs_column_data(obs: &hdf5::Group, col: &str) -> Result<ObsColumnData> {
     bail!("obs/{col} is not a supported categorical or numeric column")
 }
 
+fn read_single_dataset_group_as_strings(group: &hdf5::Group) -> Result<Vec<String>> {
+    let ds = single_member_dataset(group)?;
+    if let Ok(values) = read_string_dataset(&ds) {
+        return Ok(values);
+    }
+    if let Ok(values) = read_numeric_obs_values(&ds) {
+        return Ok(values
+            .into_iter()
+            .map(|value| value.map_or_else(String::new, format_numeric_for_string))
+            .collect());
+    }
+    if let Ok(values) = ds.read_1d::<bool>() {
+        return Ok(values
+            .iter()
+            .map(|value| {
+                if *value {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            })
+            .collect());
+    }
+    bail!("single-member group is not readable as string, numeric, or bool")
+}
+
+fn read_single_dataset_group_column(group: &hdf5::Group) -> Result<ObsColumnData> {
+    let ds = single_member_dataset(group)?;
+    if let Ok(values) = read_string_dataset(&ds) {
+        let categories = collect_categories_in_order(&values);
+        return Ok(ObsColumnData::Categorical { values, categories });
+    }
+    if let Ok(values) = ds.read_1d::<bool>() {
+        let strings: Vec<String> = values
+            .iter()
+            .map(|value| {
+                if *value {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            })
+            .collect();
+        let categories = collect_categories_in_order(&strings);
+        return Ok(ObsColumnData::Categorical {
+            values: strings,
+            categories,
+        });
+    }
+    if let Ok(values) = read_numeric_obs_values(&ds) {
+        return Ok(ObsColumnData::Numeric { values });
+    }
+    bail!("single-member group is not a supported categorical or numeric column")
+}
+
+fn single_member_dataset(group: &hdf5::Group) -> Result<hdf5::Dataset> {
+    let members = group.member_names().context("listing group members")?;
+    if members.len() != 1 {
+        bail!("group does not contain exactly one member");
+    }
+    group.dataset(&members[0]).with_context(|| {
+        format!(
+            "group '{}' member '{}' is not a dataset",
+            group.name(),
+            members[0]
+        )
+    })
+}
+
 fn collect_categories_in_order(values: &[String]) -> Vec<String> {
     let mut seen: HashMap<&str, ()> = HashMap::new();
     let mut categories = Vec::new();
@@ -796,6 +959,60 @@ fn read_string_dataset(ds: &hdf5::Dataset) -> Result<Vec<String>> {
     ds.read_1d::<VarLenUnicode>()
         .map(|values| values.iter().map(|value| value.to_string()).collect())
         .context("reading string dataset")
+}
+
+fn read_string_group(group: &hdf5::Group) -> Result<Vec<String>> {
+    let encoding = read_string_attr(group, "encoding-type")?;
+    match encoding.as_str() {
+        "nullable-string-array" => {
+            let mask = group
+                .dataset("mask")
+                .context("opening nullable-string-array mask")?
+                .read_1d::<bool>()
+                .context("reading nullable-string-array mask")?;
+            let values = read_string_dataset(
+                &group
+                    .dataset("values")
+                    .context("opening nullable-string-array values")?,
+            )?;
+            if mask.len() != values.len() {
+                bail!("nullable-string-array mask/value length mismatch");
+            }
+            Ok(mask
+                .iter()
+                .zip(values)
+                .map(|(is_null, value)| if *is_null { String::new() } else { value })
+                .collect())
+        }
+        other => bail!("unsupported string group encoding '{other}'"),
+    }
+}
+
+fn read_nullable_numeric_group(group: &hdf5::Group) -> Result<Vec<Option<f64>>> {
+    let encoding = read_string_attr(group, "encoding-type")?;
+    match encoding.as_str() {
+        "nullable-integer" | "nullable-unsigned-integer" | "nullable-float" => {
+            let mask = group
+                .dataset("mask")
+                .context("opening nullable numeric mask")?
+                .read_1d::<bool>()
+                .context("reading nullable numeric mask")?;
+            let values = read_numeric_obs_values(
+                &group
+                    .dataset("values")
+                    .context("opening nullable numeric values")?,
+            )?;
+            if mask.len() != values.len() {
+                bail!("nullable numeric mask/value length mismatch");
+            }
+            Ok(mask
+                .iter()
+                .zip(values)
+                .map(|(is_null, value)| if *is_null { None } else { value })
+                .collect())
+        }
+        other => bail!("unsupported nullable numeric encoding '{other}'"),
+    }
 }
 
 fn read_categorical_labels(ds: &hdf5::Dataset) -> Result<Vec<String>> {
@@ -821,6 +1038,16 @@ fn read_categorical_labels(ds: &hdf5::Dataset) -> Result<Vec<String>> {
             .collect());
     }
     bail!("categorical labels are not stored as string, numeric, or bool values")
+}
+
+fn read_categorical_labels_from_group(group: &hdf5::Group) -> Result<Vec<String>> {
+    if let Ok(ds) = group.dataset("categories") {
+        return read_categorical_labels(&ds);
+    }
+    if let Ok(categories_group) = group.group("categories") {
+        return read_string_group(&categories_group);
+    }
+    bail!("categorical labels are not stored in categories dataset or group")
 }
 
 fn read_category_codes(ds: &hdf5::Dataset) -> Result<Vec<i64>> {
