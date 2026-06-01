@@ -168,7 +168,10 @@ pub struct DenseMatrixUpdate {
 pub struct CsrMatrix {
     pub data: Vec<f32>,
     pub indices: Vec<i32>,
-    pub indptr: Vec<i32>,
+    // i64 (not i32): for large matrices the cumulative offsets exceed i32::MAX
+    // (e.g. >2.1B nonzeros). indices stays i32 since column indices are bounded
+    // by ncols, which is always small.
+    pub indptr: Vec<i64>,
     pub nrows: usize,
     pub ncols: usize,
 }
@@ -657,7 +660,7 @@ fn read_expression_matrix(file: &hdf5::File, layer: Option<&str>) -> Result<Expr
                     return Ok(ExpressionMatrix::Sparse(CsrMatrix {
                         data,
                         indices: indices.into_iter().map(|value| value as i32).collect(),
-                        indptr: indptr.into_iter().map(|value| value as i32).collect(),
+                        indptr: indptr.into_iter().map(|value| value as i64).collect(),
                         nrows,
                         ncols,
                     }));
@@ -721,7 +724,7 @@ fn csc_to_csr_matrix(
     Ok(CsrMatrix {
         data: csr_data,
         indices: csr_indices,
-        indptr: csr_indptr_u.into_iter().map(|value| value as i32).collect(),
+        indptr: csr_indptr_u.into_iter().map(|value| value as i64).collect(),
         nrows,
         ncols,
     })
@@ -1155,22 +1158,27 @@ fn format_numeric_for_string(value: f64) -> String {
 }
 
 fn read_usize_vec(ds: &hdf5::Dataset) -> Result<Vec<usize>> {
-    if let Ok(values) = ds.read_1d::<i32>() {
-        return values
-            .iter()
-            .map(|&value| checked_i64_to_usize(value as i64))
-            .collect();
-    }
+    // Try the widest signed/unsigned types first. HDF5 performs automatic
+    // datatype conversion on read, and requesting a narrower type than the
+    // stored one (e.g. i32 from an int64 dataset) silently clamps values that
+    // overflow the destination. For large matrices the indptr terminal value
+    // (== nnz) can exceed i32::MAX, so i32-first would corrupt it.
     if let Ok(values) = ds.read_1d::<i64>() {
         return values
             .iter()
             .map(|&value| checked_i64_to_usize(value))
             .collect();
     }
-    if let Ok(values) = ds.read_1d::<u32>() {
+    if let Ok(values) = ds.read_1d::<u64>() {
         return Ok(values.iter().map(|&value| value as usize).collect());
     }
-    if let Ok(values) = ds.read_1d::<u64>() {
+    if let Ok(values) = ds.read_1d::<i32>() {
+        return values
+            .iter()
+            .map(|&value| checked_i64_to_usize(value as i64))
+            .collect();
+    }
+    if let Ok(values) = ds.read_1d::<u32>() {
         return Ok(values.iter().map(|&value| value as usize).collect());
     }
     bail!("integer dataset is not a supported index type")
@@ -1200,7 +1208,9 @@ fn read_csr_matrix_path(file: &hdf5::File, path: &str) -> Result<CsrMatrix> {
     )?;
     let (nrows, ncols) = read_csr_shape(&group)?;
     validate_csr_layout(nrows, ncols, data.len(), &indices_u, &indptr_u)?;
-    for &value in indices_u.iter().chain(indptr_u.iter()) {
+    // Only column indices must fit i32 (bounded by ncols). indptr offsets are
+    // cumulative and may exceed i32::MAX for large matrices, so it stays i64.
+    for &value in indices_u.iter() {
         if value > i32::MAX as usize {
             anyhow::bail!("csr index value {value} overflows i32");
         }
@@ -1208,7 +1218,7 @@ fn read_csr_matrix_path(file: &hdf5::File, path: &str) -> Result<CsrMatrix> {
     Ok(CsrMatrix {
         data,
         indices: indices_u.into_iter().map(|value| value as i32).collect(),
-        indptr: indptr_u.into_iter().map(|value| value as i32).collect(),
+        indptr: indptr_u.into_iter().map(|value| value as i64).collect(),
         nrows,
         ncols,
     })

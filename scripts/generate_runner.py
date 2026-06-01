@@ -107,9 +107,10 @@ class _H5adProxy:
         # obs columns (skip _index)
         self._obs_cols = [k for k in obs_grp.keys() if k != "_index"]
 
-        # n_obs from X indptr (CSR) or first obs column length
-        if "X" in self._f and "indptr" in self._f["X"]:
-            self.n_obs = len(self._f["X"]["indptr"]) - 1
+        # n_obs from X indptr (CSR group) or first obs column length
+        x_obj = self._f.get("X")
+        if isinstance(x_obj, h5py.Group) and "indptr" in x_obj:
+            self.n_obs = len(x_obj["indptr"]) - 1
         else:
             first = self._obs_cols[0]
             v = obs_grp[first]

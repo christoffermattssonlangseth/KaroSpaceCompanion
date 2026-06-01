@@ -309,14 +309,14 @@ fn csr_from_neighbors(
     let mut data = Vec::new();
     let mut indices = Vec::new();
     let mut indptr = Vec::with_capacity(n + 1);
-    indptr.push(0i32);
+    indptr.push(0i64);
 
     for row in neighbors {
         for &(col, distance) in row {
             data.push(value_for_edge(col, distance));
             indices.push(col as i32);
         }
-        indptr.push(data.len() as i32);
+        indptr.push(data.len() as i64);
     }
 
     CsrMatrix {
