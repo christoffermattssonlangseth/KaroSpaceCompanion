@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT="${1:-/Users/chrislangseth/Downloads/STOMICS.slim.h5ad}"
-OUTPUT_H5AD="${2:-/Users/chrislangseth/Downloads/STOMICS.slim.companion.ready.h5ad}"
+INPUT="${1:-/Users/christoffer/Downloads/STOMICS.slim.h5ad}"
+OUTPUT_H5AD="${2:-/Users/christoffer/Downloads/STOMICS.slim.companion.ready.h5ad}"
 
 cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 from collections import Counter
 from pathlib import Path
 
@@ -225,6 +226,9 @@ def build_script_content(
     normalize_from_counts: bool,
     viewer_neighbor_permutations: int | None,
 ) -> str:
+    def shell_quote(value: str) -> str:
+        return shlex.quote(value)
+
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -237,9 +241,9 @@ def build_script_content(
         "  --delaunay \\",
     ]
     if groupby:
-        lines.append(f"  --groupby {groupby} \\")
+        lines.append(f"  --groupby {shell_quote(groupby)} \\")
     if composition:
-        lines.append(f"  --composition-cell-type {composition} \\")
+        lines.append(f"  --composition-cell-type {shell_quote(composition)} \\")
     if normalize_from_counts:
         lines.append("  --normalize-from layer:counts \\")
     if skip_normalized_layer:
@@ -252,7 +256,9 @@ def build_script_content(
         ]
     )
     if analytics:
-        lines.append(f"  --viewer-analytics-columns {','.join(analytics)} \\")
+        lines.append(
+            f"  --viewer-analytics-columns {shell_quote(','.join(analytics))} \\"
+        )
     if viewer_neighbor_permutations is not None:
         lines.append(
             f"  --viewer-neighbor-permutations {viewer_neighbor_permutations} \\"

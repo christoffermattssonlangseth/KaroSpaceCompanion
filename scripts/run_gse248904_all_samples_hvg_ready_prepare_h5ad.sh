@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT="${1:-/Users/chrislangseth/Downloads/GSE248904_All_Samples_HVG.ready.h5ad}"
-OUTPUT_H5AD="${2:-/Users/chrislangseth/Downloads/GSE248904_All_Samples_HVG.companion.ready.h5ad}"
+INPUT="${1:-/Users/christoffer/work/karolinska/development/KaroSpaceDataWrangling/data/gse248904/GSE248904_All_Samples_HVG.ready.h5ad}"
+OUTPUT_H5AD="${2:-/Users/christoffer/work/karolinska/development/KaroSpaceDataWrangling/data/gse248904/GSE248904_All_Samples_HVG.companion.ready.h5ad}"
 
 cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \
@@ -13,7 +13,7 @@ cargo run --release --offline -- prepare "$INPUT" \
   --skip-aggregation \
   --overwrite-derived \
   --persist-analytics-in-h5ad \
-  --viewer-analytics-columns clusters,Treatment,Organ_Full_Name,Subregion \
+  --viewer-analytics-columns 'clusters,Treatment,Organ_Full_Name,Subregion,Organ,Other Annotation' \
   --skip-viewer-interaction-markers \
   --viewer-cluster-de-method t-test
 
