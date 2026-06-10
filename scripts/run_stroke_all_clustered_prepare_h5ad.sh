@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT="${1:-/Users/chrislangseth/Downloads/stroke_all_clustered.h5ad}"
-OUTPUT_H5AD="${2:-/Users/chrislangseth/Downloads/stroke_all_clustered.companion.ready.h5ad}"
+INPUT="${1:-/Volumes/T7/Stroke_merscop_Fan_CG/h5ad/stroke_all_clustered.h5ad}"
+OUTPUT_H5AD="${2:-/Volumes/T7/Stroke_merscop_Fan_CG/h5ad/stroke_all_clustered.companion.ready.h5ad}"
 
-# Xenium dataset (~261k cells, 3 samples). X is log-normalized and raw counts
-# live in layers["counts"], so we normalize from the counts layer. There is no
-# uns/spatial group, so this dataset carries no DAPI/HE images. At >200k cells
-# the neighbor-stats z-score permutation pass auto-disables.
+# MERSCOPE stroke atlas (~2.11M cells, 33 samples). X is log-normalized and raw
+# counts live in layers["counts"], so we normalize from the counts layer. There
+# is no uns/spatial group, so this dataset carries no DAPI/HE images. Well above
+# 200k cells, so the neighbor-stats z-score permutation pass auto-disables.
+# Clusters are in `leiden` (16 clusters); the rest are experiment metadata
+# (condition, treatment, timepoint, model, line, injured, ...).
 cargo run --release --offline -- prepare "$INPUT" \
   --output "$OUTPUT_H5AD" \
   --delaunay \
@@ -17,7 +19,7 @@ cargo run --release --offline -- prepare "$INPUT" \
   --skip-aggregation \
   --overwrite-derived \
   --persist-analytics-in-h5ad \
-  --viewer-analytics-columns leiden \
+  --viewer-analytics-columns leiden,condition,treatment,timepoint,model,line,injured \
   --skip-viewer-interaction-markers \
   --viewer-cluster-de-method t-test
 
