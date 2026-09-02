@@ -131,6 +131,16 @@ impl DeMethod {
             other => bail!("unsupported DE method '{other}'"),
         }
     }
+
+    /// Discriminator written into the cluster-DE payload `_summary.source` so the
+    /// KaroSpace viewer can label these as cell-level descriptive markers
+    /// (t-test / Wilcoxon) rather than pseudobulk DESeq2 results.
+    fn source_tag(self) -> &'static str {
+        match self {
+            Self::TTest => "companion_ttest",
+            Self::Wilcoxon => "companion_wilcoxon",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -167,6 +177,7 @@ struct NeighborStatsContext {
 struct DifferentialExpressionResult {
     genes: Vec<String>,
     logfoldchanges: Vec<Option<f64>>,
+    pvals: Vec<Option<f64>>,
     pvals_adj: Vec<Option<f64>>,
     scores: Vec<Option<f64>>,
     pct_a: Vec<Option<f64>>,
@@ -429,7 +440,7 @@ fn compute_companion_analytics_from_loaded(
         config.marker_genes_top_n,
         Some(reporter),
     );
-    let cluster_de = compute_cluster_de(
+    let mut cluster_de = compute_cluster_de(
         &adata.expression,
         &adata.var_names,
         &analytics_columns,
@@ -437,6 +448,12 @@ fn compute_companion_analytics_from_loaded(
         config.cluster_de_min_cells,
         config.cluster_de_method,
         Some(reporter),
+    );
+    attach_cluster_de_summaries(
+        &mut cluster_de,
+        &cluster_gene_means,
+        &analytics_columns,
+        config.cluster_de_method,
     );
 
     let neighbor_stats_permutations =
@@ -1388,6 +1405,7 @@ fn compute_cluster_de(
                             "reason": "insufficient_cells",
                             "genes": [],
                             "logfoldchanges": [],
+                            "pvals": [],
                             "pvals_adj": [],
                             "scores": [],
                             "pct_source": [],
@@ -1427,6 +1445,7 @@ fn compute_cluster_de(
                         "available": true,
                         "genes": de.genes,
                         "logfoldchanges": option_vec_to_json(&de.logfoldchanges),
+                        "pvals": option_vec_to_json(&de.pvals),
                         "pvals_adj": option_vec_to_json(&de.pvals_adj),
                         "scores": option_vec_to_json(&de.scores),
                         "pct_source": option_vec_to_json(&de.pct_a),
@@ -1452,6 +1471,67 @@ fn compute_cluster_de(
         ));
     }
     Value::Object(out)
+}
+
+/// Attach a `_summary` block to each column of the cluster-DE payload so the
+/// KaroSpace viewer can (a) render the per-category gene-means panel and (b)
+/// label the results as cell-level descriptive markers via `_summary.source`
+/// and `_summary.category_gene_means.source`.
+///
+/// The per-category means themselves are reused from the already-computed
+/// `cluster_gene_means` bundle (keyed by column → `{categories, means,
+/// background}`) rather than recomputed. We fold in the total cell count per
+/// category and the method-derived source tag. This makes the contract explicit
+/// on the Rust side; the KaroSpace Python loader's backfill becomes an
+/// idempotent no-op for files produced by this build.
+fn attach_cluster_de_summaries(
+    cluster_de: &mut Value,
+    cluster_gene_means: &Value,
+    categorical_columns: &[(String, Vec<String>, Vec<String>)],
+    method: DeMethod,
+) {
+    let Value::Object(cluster_de_map) = cluster_de else {
+        return;
+    };
+    let source_tag = method.source_tag();
+    let genes = cluster_gene_means
+        .get("genes")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let columns = cluster_gene_means.get("columns");
+
+    for (column_name, values, categories) in categorical_columns {
+        let Some(Value::Object(column_payload)) = cluster_de_map.get_mut(column_name) else {
+            continue;
+        };
+
+        // Total cells per category (independent of the per-pair min_cells filter).
+        let mut n_cells = Map::new();
+        for category in categories {
+            let count = values.iter().filter(|value| *value == category).count();
+            n_cells.insert(category.clone(), json!(count));
+        }
+
+        let mut category_gene_means = Map::new();
+        category_gene_means.insert("genes".to_string(), genes.clone());
+        if let Some(column_means) = columns.and_then(|columns| columns.get(column_name)) {
+            for key in ["categories", "means", "background"] {
+                if let Some(value) = column_means.get(key) {
+                    category_gene_means.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        category_gene_means.insert("n_cells".to_string(), Value::Object(n_cells));
+        category_gene_means.insert("source".to_string(), Value::String(source_tag.to_string()));
+
+        let mut summary = Map::new();
+        summary.insert(
+            "category_gene_means".to_string(),
+            Value::Object(category_gene_means),
+        );
+        summary.insert("source".to_string(), Value::String(source_tag.to_string()));
+        column_payload.insert("_summary".to_string(), Value::Object(summary));
+    }
 }
 
 fn compute_neighbor_stats(
@@ -1970,44 +2050,50 @@ fn finalize_de_stats(
     for (pos, orig_idx) in valid_indices.iter().enumerate() {
         adjusted[*orig_idx] = adjusted_valid[pos];
     }
+    // Carry the raw (pre-BH) p-value alongside the adjusted one so the viewer can
+    // surface both a raw-p column and the adjusted column.
     let mut scored = stats
         .into_iter()
         .enumerate()
-        .map(|(idx, (gene_idx, score, _p, logfc, pct_a, pct_b))| {
-            (gene_idx, score, adjusted[idx], logfc, pct_a, pct_b)
+        .map(|(idx, (gene_idx, score, raw_p, logfc, pct_a, pct_b))| {
+            (gene_idx, score, raw_p, adjusted[idx], logfc, pct_a, pct_b)
         })
         .collect::<Vec<_>>();
     scored.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
 
     let top = scored
         .into_iter()
-        .filter(|(_, score, _, _, _, _)| score.is_finite())
+        .filter(|(_, score, _, _, _, _, _)| score.is_finite())
         .take(top_n)
         .collect::<Vec<_>>();
     DifferentialExpressionResult {
         genes: top
             .iter()
-            .map(|(gene_idx, _, _, _, _, _)| gene_names[*gene_idx].clone())
+            .map(|(gene_idx, _, _, _, _, _, _)| gene_names[*gene_idx].clone())
             .collect(),
         logfoldchanges: top
             .iter()
-            .map(|(_, _, _, value, _, _)| finite_or_none(*value))
+            .map(|(_, _, _, _, value, _, _)| finite_or_none(*value))
+            .collect(),
+        pvals: top
+            .iter()
+            .map(|(_, _, value, _, _, _, _)| finite_or_none(*value))
             .collect(),
         pvals_adj: top
             .iter()
-            .map(|(_, _, value, _, _, _)| finite_or_none(*value))
+            .map(|(_, _, _, value, _, _, _)| finite_or_none(*value))
             .collect(),
         scores: top
             .iter()
-            .map(|(_, value, _, _, _, _)| finite_or_none(*value))
+            .map(|(_, value, _, _, _, _, _)| finite_or_none(*value))
             .collect(),
         pct_a: top
             .iter()
-            .map(|(_, _, _, _, value, _)| finite_or_none(*value))
+            .map(|(_, _, _, _, _, value, _)| finite_or_none(*value))
             .collect(),
         pct_b: top
             .iter()
-            .map(|(_, _, _, _, _, value)| finite_or_none(*value))
+            .map(|(_, _, _, _, _, _, value)| finite_or_none(*value))
             .collect(),
     }
 }
