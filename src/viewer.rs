@@ -182,6 +182,9 @@ struct DifferentialExpressionResult {
     scores: Vec<Option<f64>>,
     pct_a: Vec<Option<f64>>,
     pct_b: Vec<Option<f64>>,
+    /// Pooled mean expression across both groups (source ∪ reference), the
+    /// cell-level analog of DESeq2's baseMean — used by the viewer's MA plot.
+    base_mean: Vec<Option<f64>>,
 }
 
 struct GeneExportMeta {
@@ -1450,6 +1453,7 @@ fn compute_cluster_de(
                         "scores": option_vec_to_json(&de.scores),
                         "pct_source": option_vec_to_json(&de.pct_a),
                         "pct_reference": option_vec_to_json(&de.pct_b),
+                        "base_mean": option_vec_to_json(&de.base_mean),
                         "n_source": source_indices.len(),
                         "n_reference": reference_indices.len(),
                     }),
@@ -1923,7 +1927,10 @@ fn differential_expression_from_summaries(
         let logfc = ((mean_a + 1e-9) / (mean_b + 1e-9)).log2();
         let pct_a = group_a.nnz[gene_idx] as f64 / group_a.n_cells.max(1) as f64;
         let pct_b = group_b.nnz[gene_idx] as f64 / group_b.n_cells.max(1) as f64;
-        stats.push((gene_idx, score, p_value, logfc, pct_a, pct_b));
+        // Pooled mean across both groups (cell-level baseMean analog).
+        let base_mean = (group_a.sums[gene_idx] + group_b.sums[gene_idx])
+            / (group_a.n_cells + group_b.n_cells).max(1) as f64;
+        stats.push((gene_idx, score, p_value, logfc, pct_a, pct_b, base_mean));
     }
 
     finalize_de_stats(gene_names, stats, top_n)
@@ -1955,6 +1962,9 @@ fn differential_expression(
         };
         let p_value = two_sided_p_from_z(score);
         let logfc = ((mean_a[gene_idx] + 1e-9) / (mean_b[gene_idx] + 1e-9)).log2();
+        let base_mean = (mean_a[gene_idx] * group_a.len() as f64
+            + mean_b[gene_idx] * group_b.len() as f64)
+            / (group_a.len() + group_b.len()).max(1) as f64;
         stats.push((
             gene_idx,
             score,
@@ -1962,6 +1972,7 @@ fn differential_expression(
             logfc,
             pct_a[gene_idx],
             pct_b[gene_idx],
+            base_mean,
         ));
     }
 
@@ -1993,6 +2004,9 @@ fn differential_expression_subset(
                 );
                 let p_value = two_sided_p_from_z(score);
                 let logfc = ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
+                let base_mean = (mean_a[offset] * group_a.len() as f64
+                    + mean_b[offset] * group_b.len() as f64)
+                    / (group_a.len() + group_b.len()).max(1) as f64;
                 stats.push((
                     gene_idx,
                     score,
@@ -2000,6 +2014,7 @@ fn differential_expression_subset(
                     logfc,
                     pct_a[offset],
                     pct_b[offset],
+                    base_mean,
                 ));
             }
             finalize_de_stats(gene_names, stats, top_n)
@@ -2014,6 +2029,9 @@ fn differential_expression_subset(
                     let score = wilcoxon_rank_sum_score(matrix, gene_idx, group_a, group_b);
                     let p_value = two_sided_p_from_z(score);
                     let logfc = ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
+                    let base_mean = (mean_a[offset] * group_a.len() as f64
+                        + mean_b[offset] * group_b.len() as f64)
+                        / (group_a.len() + group_b.len()).max(1) as f64;
                     (
                         gene_idx,
                         score,
@@ -2021,6 +2039,7 @@ fn differential_expression_subset(
                         logfc,
                         pct_a[offset],
                         pct_b[offset],
+                        base_mean,
                     )
                 })
                 .collect();
@@ -2031,13 +2050,13 @@ fn differential_expression_subset(
 
 fn finalize_de_stats(
     gene_names: &[String],
-    stats: Vec<(usize, f64, f64, f64, f64, f64)>,
+    stats: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
     top_n: usize,
 ) -> DifferentialExpressionResult {
     let (valid_indices, valid_p_values): (Vec<usize>, Vec<f64>) = stats
         .iter()
         .enumerate()
-        .filter_map(|(i, (_, score, p, _, _, _))| {
+        .filter_map(|(i, (_, score, p, _, _, _, _))| {
             if score.is_finite() {
                 Some((i, *p))
             } else {
@@ -2055,45 +2074,58 @@ fn finalize_de_stats(
     let mut scored = stats
         .into_iter()
         .enumerate()
-        .map(|(idx, (gene_idx, score, raw_p, logfc, pct_a, pct_b))| {
-            (gene_idx, score, raw_p, adjusted[idx], logfc, pct_a, pct_b)
+        .map(|(idx, (gene_idx, score, raw_p, logfc, pct_a, pct_b, base_mean))| {
+            (
+                gene_idx,
+                score,
+                raw_p,
+                adjusted[idx],
+                logfc,
+                pct_a,
+                pct_b,
+                base_mean,
+            )
         })
         .collect::<Vec<_>>();
     scored.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
 
     let top = scored
         .into_iter()
-        .filter(|(_, score, _, _, _, _, _)| score.is_finite())
+        .filter(|(_, score, _, _, _, _, _, _)| score.is_finite())
         .take(top_n)
         .collect::<Vec<_>>();
     DifferentialExpressionResult {
         genes: top
             .iter()
-            .map(|(gene_idx, _, _, _, _, _, _)| gene_names[*gene_idx].clone())
+            .map(|(gene_idx, _, _, _, _, _, _, _)| gene_names[*gene_idx].clone())
             .collect(),
         logfoldchanges: top
             .iter()
-            .map(|(_, _, _, _, value, _, _)| finite_or_none(*value))
+            .map(|(_, _, _, _, value, _, _, _)| finite_or_none(*value))
             .collect(),
         pvals: top
             .iter()
-            .map(|(_, _, value, _, _, _, _)| finite_or_none(*value))
+            .map(|(_, _, value, _, _, _, _, _)| finite_or_none(*value))
             .collect(),
         pvals_adj: top
             .iter()
-            .map(|(_, _, _, value, _, _, _)| finite_or_none(*value))
+            .map(|(_, _, _, value, _, _, _, _)| finite_or_none(*value))
             .collect(),
         scores: top
             .iter()
-            .map(|(_, value, _, _, _, _, _)| finite_or_none(*value))
+            .map(|(_, value, _, _, _, _, _, _)| finite_or_none(*value))
             .collect(),
         pct_a: top
             .iter()
-            .map(|(_, _, _, _, _, value, _)| finite_or_none(*value))
+            .map(|(_, _, _, _, _, value, _, _)| finite_or_none(*value))
             .collect(),
         pct_b: top
             .iter()
-            .map(|(_, _, _, _, _, _, value)| finite_or_none(*value))
+            .map(|(_, _, _, _, _, _, value, _)| finite_or_none(*value))
+            .collect(),
+        base_mean: top
+            .iter()
+            .map(|(_, _, _, _, _, _, _, value)| finite_or_none(*value))
             .collect(),
     }
 }
