@@ -115,6 +115,14 @@ struct PrepareArgs {
     #[arg(long = "viewer-cluster-de-method", default_value = "t-test")]
     viewer_cluster_de_method: String,
 
+    /// Obs column identifying biological replicates (required for --viewer-cluster-de-method deseq2).
+    #[arg(long = "viewer-deseq2-sample-column")]
+    viewer_deseq2_sample_column: Option<String>,
+
+    /// BH-adjusted p-value threshold passed to DESeq2 independent filtering.
+    #[arg(long = "viewer-deseq2-alpha", default_value_t = 0.05)]
+    viewer_deseq2_alpha: f64,
+
     #[arg(long = "viewer-interaction-method", default_value = "t-test")]
     viewer_interaction_method: String,
 
@@ -155,6 +163,8 @@ fn main() -> Result<()> {
                     cluster_de_method: DeMethod::parse(&args.viewer_cluster_de_method)?,
                     cluster_de_top_n: 20,
                     cluster_de_min_cells: 20,
+                    cluster_de_deseq2_sample_column: args.viewer_deseq2_sample_column,
+                    cluster_de_deseq2_alpha: args.viewer_deseq2_alpha,
                     neighbor_stats_permutations: args.viewer_neighbor_permutations,
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::parse(&args.viewer_interaction_method)?,

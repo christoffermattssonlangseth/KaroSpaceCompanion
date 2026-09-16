@@ -148,6 +148,9 @@ pub struct ViewerAnnDataRead {
     pub obs_columns: HashMap<String, ObsColumnData>,
     pub expression: ExpressionMatrix,
     pub expression_source: String,
+    /// Raw counts from `X` — populated only when expression was read from a
+    /// derived layer (`normalized`), so that DESeq2 can use unscaled counts.
+    pub raw_counts: Option<ExpressionMatrix>,
     pub umap: Option<Array2<f64>>,
     pub graph: Option<CsrMatrix>,
     pub graph_key: Option<String>,
@@ -406,6 +409,19 @@ pub fn read_viewer_h5ad(path: &Path) -> Result<ViewerAnnDataRead> {
             var_names.len()
         );
     }
+    // Load raw counts from X only when the expression was read from a derived
+    // layer — in that case X still holds the original unscaled counts needed
+    // by pseudobulk DESeq2.
+    let raw_counts = if expression_layer.is_some() {
+        let raw = read_expression_matrix(&file, None)?;
+        if raw.nrows() == obs_names.len() && raw.ncols() == var_names.len() {
+            Some(raw)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let umap = match read_optional_obsm_embedding(&file, "X_umap")? {
         Some(array) => {
@@ -442,6 +458,7 @@ pub fn read_viewer_h5ad(path: &Path) -> Result<ViewerAnnDataRead> {
         obs_columns,
         expression,
         expression_source: expression_layer.unwrap_or("X").to_string(),
+        raw_counts,
         umap,
         graph,
         graph_key,
@@ -525,8 +542,7 @@ fn read_index_column(group: &hdf5::Group, label: &str) -> Result<Vec<String>> {
         return read_string_dataset(&ds).with_context(|| format!("reading {label}/_index"));
     }
     if let Ok(string_group) = group.group("_index") {
-        return read_string_group(&string_group)
-            .with_context(|| format!("reading {label}/_index"));
+        return read_string_group(&string_group).with_context(|| format!("reading {label}/_index"));
     }
     if let Ok(ds) = group.dataset("index") {
         return read_string_dataset(&ds).with_context(|| format!("reading {label}/index"));
