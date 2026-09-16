@@ -1689,6 +1689,7 @@ fn compute_cluster_de_deseq2(
                                 "base_mean": [],
                                 "n_source": source_indices.len(),
                                 "n_reference": reference_indices.len(),
+                                "min_replicates_required": 2,
                             }),
                         );
                     }
