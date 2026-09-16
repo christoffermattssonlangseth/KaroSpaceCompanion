@@ -507,6 +507,23 @@ pub fn write_augmented_outputs(path: &Path, outputs: AugmentedOutputs) -> Result
     }
 
     let metadata_group = ensure_dict_group(&file, "uns/karospace_companion")?;
+    // Purge obsolete analytics keys left behind when re-preparing a file that
+    // was previously written by an older companion. KaroSpace ignores unknown
+    // keys, but stale legacy blobs bloat the file and are misleading.
+    const OBSOLETE_ANALYTICS_KEYS: [&str; 5] = [
+        "cluster_de_json",
+        "marker_genes_json",
+        "cluster_gene_means_json",
+        "gene_correlations_json",
+        "spatial_variable_genes_json",
+    ];
+    for key in OBSOLETE_ANALYTICS_KEYS {
+        if metadata_group.link_exists(key) {
+            metadata_group
+                .unlink(key)
+                .with_context(|| format!("removing stale 'uns/karospace_companion/{key}'"))?;
+        }
+    }
     for (key, value) in outputs.metadata.strings {
         write_string_scalar(&metadata_group, &key, &value, true)?;
     }
