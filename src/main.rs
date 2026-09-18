@@ -10,6 +10,7 @@ use karospace_companion::{prepare, PrepareConfig};
 
 #[derive(Parser)]
 #[command(name = "karospace-companion")]
+#[command(version)]
 #[command(about = "Prepare KaroSpace-ready h5ad files in Rust")]
 struct Cli {
     #[command(subcommand)]
