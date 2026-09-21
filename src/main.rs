@@ -124,6 +124,11 @@ struct PrepareArgs {
     #[arg(long = "viewer-deseq2-alpha", default_value_t = 0.05)]
     viewer_deseq2_alpha: f64,
 
+    /// Absolute log2 fold-change cutoff stamped onto pseudobulk_de leaves so the
+    /// KaroSpace viewer counts significant features against it.
+    #[arg(long = "viewer-log2fc-cutoff", default_value_t = 0.5)]
+    viewer_log2fc_cutoff: f64,
+
     #[arg(long = "viewer-interaction-method", default_value = "t-test")]
     viewer_interaction_method: String,
 
@@ -166,6 +171,7 @@ fn main() -> Result<()> {
                     cluster_de_min_cells: 20,
                     cluster_de_deseq2_sample_column: args.viewer_deseq2_sample_column,
                     cluster_de_deseq2_alpha: args.viewer_deseq2_alpha,
+                    cluster_de_log2fc_cutoff: args.viewer_log2fc_cutoff,
                     neighbor_stats_permutations: args.viewer_neighbor_permutations,
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::parse(&args.viewer_interaction_method)?,
