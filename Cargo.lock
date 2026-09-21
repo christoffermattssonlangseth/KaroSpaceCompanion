@@ -998,6 +998,7 @@ dependencies = [
 [[package]]
 name = "rust_deseq2"
 version = "0.1.0"
+source = "git+https://github.com/necoli1822/rust_deseq2?rev=2383ef8#2383ef82da3ab9da260c93133a0c4d0132160fb7"
 dependencies = [
  "anyhow",
  "approx",
