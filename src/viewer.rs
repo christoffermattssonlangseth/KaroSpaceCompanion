@@ -3,6 +3,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rust_deseq2::prelude::{
+    CountMatrix as DeseqCountMatrix, DESeqDataSet, SampleMetadata as DeseqSampleMetadata,
+};
+use rust_deseq2::{deseq_results as deseq2_results, run_deseq};
+
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -55,6 +60,12 @@ pub struct ViewerPrecomputeConfig {
     pub cluster_de_method: DeMethod,
     pub cluster_de_top_n: usize,
     pub cluster_de_min_cells: usize,
+    /// Obs column whose values identify biological replicates (samples/donors).
+    /// Required when `cluster_de_method` is `Deseq2`; each unique value in that
+    /// column becomes one pseudobulk sample.
+    pub cluster_de_deseq2_sample_column: Option<String>,
+    /// BH-adjusted p-value threshold for DESeq2 independent filtering.
+    pub cluster_de_deseq2_alpha: f64,
     pub neighbor_stats_permutations: Option<usize>,
     pub neighbor_stats_seed: u64,
     pub interaction_markers_method: DeMethod,
@@ -70,6 +81,12 @@ pub struct CompanionAnalyticsBundle {
     pub analytics_columns: Vec<String>,
     pub marker_genes: Value,
     pub cluster_de: Value,
+    /// KaroSpace-format cluster-DE payload for `uns` ingestion (renamed leaf
+    /// fields, one-vs-rest `__rest__` contrasts, `category_feature_means`
+    /// summary). Derived from [`Self::cluster_de`] plus freshly-computed rest
+    /// contrasts; kept separate so the standalone `--viewer-json` document (which
+    /// serialises [`Self::cluster_de`]) stays byte-stable.
+    pub pseudobulk_de: Value,
     pub neighbor_stats: Value,
     pub interaction_markers: Value,
     pub gene_correlations: Value,
@@ -78,15 +95,21 @@ pub struct CompanionAnalyticsBundle {
 }
 
 impl CompanionAnalyticsBundle {
+    /// Serialize the analytics blocks the KaroSpace viewer actually ingests from
+    /// `uns["karospace_companion"]` (`data_loader.py:_load_companion_analytics`).
+    ///
+    /// At HEAD only three keys are consumed: `pseudobulk_de_json`,
+    /// `neighbor_stats_json`, `interaction_markers_json`. The former
+    /// `marker_genes_json` / `cluster_de_json` / `gene_correlations_json` /
+    /// `spatial_variable_genes_json` / `cluster_gene_means_json` keys were dropped
+    /// from KaroSpace's ingestion map — it recomputes correlations / spatial
+    /// variable features itself and derives markers / gene-means from the DE
+    /// payload — so emitting them is dead weight and is omitted here.
     pub fn to_json_scalars(&self) -> Result<Vec<(String, String)>> {
         Ok(vec![
             (
-                "marker_genes_json".to_string(),
-                serde_json::to_string(&self.marker_genes).context("serializing marker_genes")?,
-            ),
-            (
-                "cluster_de_json".to_string(),
-                serde_json::to_string(&self.cluster_de).context("serializing cluster_de")?,
+                "pseudobulk_de_json".to_string(),
+                serde_json::to_string(&self.pseudobulk_de).context("serializing pseudobulk_de")?,
             ),
             (
                 "neighbor_stats_json".to_string(),
@@ -95,23 +118,8 @@ impl CompanionAnalyticsBundle {
             ),
             (
                 "interaction_markers_json".to_string(),
-                serde_json::to_string(&self.interaction_markers)
+                serde_json::to_string(&karospace_interaction_markers(&self.interaction_markers))
                     .context("serializing interaction_markers")?,
-            ),
-            (
-                "gene_correlations_json".to_string(),
-                serde_json::to_string(&self.gene_correlations)
-                    .context("serializing gene_correlations")?,
-            ),
-            (
-                "spatial_variable_genes_json".to_string(),
-                serde_json::to_string(&self.spatial_variable_genes)
-                    .context("serializing spatial_variable_genes")?,
-            ),
-            (
-                "cluster_gene_means_json".to_string(),
-                serde_json::to_string(&self.cluster_gene_means)
-                    .context("serializing cluster_gene_means")?,
             ),
         ])
     }
@@ -121,6 +129,7 @@ impl CompanionAnalyticsBundle {
 pub enum DeMethod {
     TTest,
     Wilcoxon,
+    Deseq2,
 }
 
 impl DeMethod {
@@ -128,7 +137,41 @@ impl DeMethod {
         match value.trim().to_ascii_lowercase().as_str() {
             "t-test" | "ttest" | "t_test" => Ok(Self::TTest),
             "wilcoxon" | "rank-sum" | "ranksum" => Ok(Self::Wilcoxon),
+            "deseq2" | "deseq" => Ok(Self::Deseq2),
             other => bail!("unsupported DE method '{other}'"),
+        }
+    }
+
+    /// Discriminator written into the legacy standalone-viewer cluster-DE payload
+    /// `_summary.source`. Retained verbatim so the `--viewer-json` document stays
+    /// byte-stable; the KaroSpace `uns` payload uses [`karospace_source_tag`].
+    fn source_tag(self) -> &'static str {
+        match self {
+            Self::TTest => "companion_ttest",
+            Self::Wilcoxon => "companion_wilcoxon",
+            Self::Deseq2 => "companion_deseq2",
+        }
+    }
+
+    /// `_summary...source` tag understood by the KaroSpace viewer's DE method
+    /// badge (`data_loader.py:_category_feature_means_from_pseudobulk_de`,
+    /// `getPseudobulkDEMethodBadge`). `cell_welch*` renders as a descriptive
+    /// single-sample marker badge; everything else renders as "Pseudobulk DE".
+    fn karospace_source_tag(self) -> &'static str {
+        match self {
+            Self::TTest => "cell_welch",
+            Self::Wilcoxon => "cell_wilcoxon",
+            Self::Deseq2 => "pseudobulk_aggregate",
+        }
+    }
+
+    /// Per-contrast `method` string carried on each KaroSpace `pseudobulk_de`
+    /// leaf. Not validated on ingestion; used by the viewer's DE table/badge.
+    fn karospace_method_tag(self) -> &'static str {
+        match self {
+            Self::TTest => "welch",
+            Self::Wilcoxon => "wilcoxon",
+            Self::Deseq2 => "pseudobulk-deseq2",
         }
     }
 }
@@ -167,10 +210,14 @@ struct NeighborStatsContext {
 struct DifferentialExpressionResult {
     genes: Vec<String>,
     logfoldchanges: Vec<Option<f64>>,
+    pvals: Vec<Option<f64>>,
     pvals_adj: Vec<Option<f64>>,
     scores: Vec<Option<f64>>,
     pct_a: Vec<Option<f64>>,
     pct_b: Vec<Option<f64>>,
+    /// Pooled mean expression across both groups (source ∪ reference), the
+    /// cell-level analog of DESeq2's baseMean — used by the viewer's MA plot.
+    base_mean: Vec<Option<f64>>,
 }
 
 struct GeneExportMeta {
@@ -429,15 +476,63 @@ fn compute_companion_analytics_from_loaded(
         config.marker_genes_top_n,
         Some(reporter),
     );
-    let cluster_de = compute_cluster_de(
+    // DESeq2 sample/replicate labels (used by both the pairwise and one-vs-rest
+    // pseudobulk contrasts); `None` for the cell-level Welch/Wilcoxon methods.
+    let deseq2_sample_values = if config.cluster_de_method == DeMethod::Deseq2 {
+        config
+            .cluster_de_deseq2_sample_column
+            .as_deref()
+            .and_then(|col| adata.obs_columns.get(col))
+            .map(|col| col.as_strings())
+    } else {
+        None
+    };
+    let mut cluster_de = if config.cluster_de_method == DeMethod::Deseq2 {
+        compute_cluster_de_deseq2(
+            &adata.expression,
+            adata.raw_counts.as_ref(),
+            &adata.var_names,
+            &analytics_columns,
+            deseq2_sample_values.as_deref(),
+            config.cluster_de_top_n,
+            config.cluster_de_min_cells,
+            config.cluster_de_deseq2_alpha,
+            Some(reporter),
+        )
+    } else {
+        compute_cluster_de(
+            &adata.expression,
+            &adata.var_names,
+            &analytics_columns,
+            config.cluster_de_top_n,
+            config.cluster_de_min_cells,
+            config.cluster_de_method,
+            Some(reporter),
+        )
+    };
+    attach_cluster_de_summaries(
+        &mut cluster_de,
+        &cluster_gene_means,
+        &analytics_columns,
+        config.cluster_de_method,
+    );
+
+    // KaroSpace `uns` ingestion payload: freshly-computed one-vs-rest contrasts
+    // plus the pairwise `cluster_de` relabelled into KaroSpace field names. The
+    // standalone `--viewer-json` document keeps serialising `cluster_de` as-is.
+    let rest_contrasts = compute_cluster_de_rest(
         &adata.expression,
+        adata.raw_counts.as_ref(),
         &adata.var_names,
         &analytics_columns,
+        deseq2_sample_values.as_deref(),
         config.cluster_de_top_n,
         config.cluster_de_min_cells,
+        config.cluster_de_deseq2_alpha,
         config.cluster_de_method,
         Some(reporter),
     );
+    let pseudobulk_de = build_pseudobulk_de(&cluster_de, &rest_contrasts, config.cluster_de_method);
 
     let neighbor_stats_permutations =
         resolve_neighbor_stats_permutations(config, adata.obs_names.len());
@@ -488,6 +583,7 @@ fn compute_companion_analytics_from_loaded(
         analytics_columns: analytics_column_names,
         marker_genes,
         cluster_de,
+        pseudobulk_de,
         neighbor_stats,
         interaction_markers,
         gene_correlations,
@@ -1332,6 +1428,360 @@ fn compute_marker_genes(
     Value::Object(out)
 }
 
+/// Aggregate raw counts for a set of cell indices, grouped by `sample_labels`.
+/// Returns `(sample_id, gene_counts_f64)` in sorted sample order.
+fn aggregate_pseudobulk(
+    matrix: &ExpressionMatrix,
+    cell_indices: &[usize],
+    sample_labels: &[String],
+    n_genes: usize,
+) -> Vec<(String, Vec<f64>)> {
+    let mut by_sample: HashMap<String, Vec<f64>> = HashMap::new();
+    for &cell_idx in cell_indices {
+        let sample = sample_labels
+            .get(cell_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if sample.is_empty() {
+            continue;
+        }
+        let sums = by_sample
+            .entry(sample)
+            .or_insert_with(|| vec![0.0f64; n_genes]);
+        matrix.for_each_nonzero_in_row(cell_idx, |gene_idx, value| {
+            if gene_idx < n_genes {
+                sums[gene_idx] += f64::from(value);
+            }
+        });
+    }
+    let mut sorted: Vec<_> = by_sample.into_iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted
+}
+
+/// Run DESeq2 for one (source, reference) pair and return a
+/// `DifferentialExpressionResult` sorted by Wald statistic (descending).
+///
+/// Returns `None` when there are insufficient replicates for DESeq2.
+fn run_deseq2_pairwise(
+    counts_matrix: &ExpressionMatrix,
+    gene_names: &[String],
+    source_indices: &[usize],
+    reference_indices: &[usize],
+    sample_labels: Option<&[String]>,
+    top_n: usize,
+    alpha: f64,
+) -> Option<DifferentialExpressionResult> {
+    use ndarray016::Array2 as Arr2;
+
+    let n_genes = gene_names.len();
+
+    let (mat, col_ids, conditions): (Arr2<f64>, Vec<String>, Vec<String>) =
+        if let Some(labels) = sample_labels {
+            let src = aggregate_pseudobulk(counts_matrix, source_indices, labels, n_genes);
+            let rref = aggregate_pseudobulk(counts_matrix, reference_indices, labels, n_genes);
+            if src.len() < 2 || rref.len() < 2 {
+                return None;
+            }
+            let n_total = src.len() + rref.len();
+            let mut mat = Arr2::<f64>::zeros((n_genes, n_total));
+            let mut col_ids = Vec::with_capacity(n_total);
+            let mut conditions = Vec::with_capacity(n_total);
+            for (j, (sid, counts)) in src.iter().enumerate() {
+                for i in 0..n_genes {
+                    mat[[i, j]] = counts[i];
+                }
+                col_ids.push(format!("src_{sid}"));
+                conditions.push("source".to_string());
+            }
+            let n_src = src.len();
+            for (j, (sid, counts)) in rref.iter().enumerate() {
+                for i in 0..n_genes {
+                    mat[[i, n_src + j]] = counts[i];
+                }
+                col_ids.push(format!("ref_{sid}"));
+                conditions.push("reference".to_string());
+            }
+            (mat, col_ids, conditions)
+        } else {
+            // Cell-level pseudo-replication (each cell = one pseudo-sample).
+            let n_total = source_indices.len() + reference_indices.len();
+            let mut mat = Arr2::<f64>::zeros((n_genes, n_total));
+            let mut col_ids = Vec::with_capacity(n_total);
+            let mut conditions = Vec::with_capacity(n_total);
+            for (j, &cell_idx) in source_indices.iter().enumerate() {
+                counts_matrix.for_each_nonzero_in_row(cell_idx, |gi, v| {
+                    if gi < n_genes {
+                        mat[[gi, j]] = f64::from(v);
+                    }
+                });
+                col_ids.push(format!("src_{cell_idx}"));
+                conditions.push("source".to_string());
+            }
+            let n_src = source_indices.len();
+            for (j, &cell_idx) in reference_indices.iter().enumerate() {
+                counts_matrix.for_each_nonzero_in_row(cell_idx, |gi, v| {
+                    if gi < n_genes {
+                        mat[[gi, n_src + j]] = f64::from(v);
+                    }
+                });
+                col_ids.push(format!("ref_{cell_idx}"));
+                conditions.push("reference".to_string());
+            }
+            (mat, col_ids, conditions)
+        };
+
+    let count_matrix = DeseqCountMatrix::new(mat, gene_names.to_vec(), col_ids).ok()?;
+    let mut metadata = DeseqSampleMetadata::new(count_matrix.sample_ids().to_vec());
+    metadata.add_condition("condition", conditions).ok()?;
+    let mut dds = DESeqDataSet::new(count_matrix, metadata, "condition").ok()?;
+    let design_info = run_deseq(&mut dds).ok()?;
+    let res = deseq2_results(&dds, &design_info, "source", "reference", alpha).ok()?;
+
+    // Sort genes by |Wald stat| descending, take top_n.
+    let mut indexed: Vec<(usize, f64)> = res
+        .stat
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, s)| s.is_finite())
+        .collect();
+    indexed.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(Ordering::Equal));
+    indexed.truncate(top_n);
+
+    let base_mean_all: f64 = {
+        let total: f64 = res.base_means.iter().filter(|v| v.is_finite()).sum();
+        let n = res.base_means.iter().filter(|v| v.is_finite()).count();
+        if n > 0 {
+            total / n as f64
+        } else {
+            0.0
+        }
+    };
+    let _ = base_mean_all;
+
+    Some(DifferentialExpressionResult {
+        genes: indexed
+            .iter()
+            .map(|(i, _)| res.gene_ids[*i].clone())
+            .collect(),
+        logfoldchanges: indexed
+            .iter()
+            .map(|(i, _)| finite_or_none(res.log2_fold_changes[*i]))
+            .collect(),
+        pvals: indexed
+            .iter()
+            .map(|(i, _)| finite_or_none(res.pvalues[*i]))
+            .collect(),
+        pvals_adj: indexed
+            .iter()
+            .map(|(i, _)| finite_or_none(res.padj[*i]))
+            .collect(),
+        scores: indexed
+            .iter()
+            .map(|(i, _)| finite_or_none(res.stat[*i]))
+            .collect(),
+        pct_a: indexed.iter().map(|_| None).collect(),
+        pct_b: indexed.iter().map(|_| None).collect(),
+        base_mean: indexed
+            .iter()
+            .map(|(i, _)| finite_or_none(res.base_means[*i]))
+            .collect(),
+    })
+}
+
+/// Compute cluster DE using pseudobulk DESeq2 via the `rust_deseq2` crate.
+///
+/// `counts_matrix` is the raw count matrix (from `X`), or falls back to the
+/// normalized expression when raw counts are unavailable.
+/// `expr_matrix` is the normalized expression used only for pct_source / pct_reference.
+fn compute_cluster_de_deseq2(
+    expr_matrix: &ExpressionMatrix,
+    counts_matrix: Option<&ExpressionMatrix>,
+    gene_names: &[String],
+    categorical_columns: &[(String, Vec<String>, Vec<String>)],
+    sample_labels: Option<&[String]>,
+    top_n: usize,
+    min_cells: usize,
+    alpha: f64,
+    reporter: Option<&ProgressReporter>,
+) -> Value {
+    let mut stage = reporter.map(|r| r.stage("Computing cluster DE (DESeq2)"));
+    let mut out = Map::new();
+    let effective_counts = counts_matrix.unwrap_or(expr_matrix);
+
+    for (column_idx, (column_name, values, categories)) in categorical_columns.iter().enumerate() {
+        if let Some(stage) = stage.as_mut() {
+            stage.progress("columns", column_idx + 1, categorical_columns.len());
+            stage.note(format!(
+                "column {}/{}: {} ({} categories)",
+                column_idx + 1,
+                categorical_columns.len(),
+                column_name,
+                categories.len()
+            ));
+        }
+        let mut group_out = Map::new();
+        for (source_idx, source) in categories.iter().enumerate() {
+            if let Some(stage) = stage.as_mut() {
+                stage.progress("source groups", source_idx + 1, categories.len());
+            }
+            let source_indices: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, v)| if v == source { Some(idx) } else { None })
+                .collect();
+            let mut source_out = Map::new();
+            for reference in categories.iter() {
+                if reference == source {
+                    continue;
+                }
+                let reference_indices: Vec<usize> = values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, v)| if v == reference { Some(idx) } else { None })
+                    .collect();
+                if source_indices.len() < min_cells || reference_indices.len() < min_cells {
+                    source_out.insert(
+                        reference.clone(),
+                        json!({
+                            "available": false,
+                            "reason": "insufficient_cells",
+                            "genes": [],
+                            "logfoldchanges": [],
+                            "pvals": [],
+                            "pvals_adj": [],
+                            "scores": [],
+                            "pct_source": [],
+                            "pct_reference": [],
+                            "base_mean": [],
+                            "n_source": source_indices.len(),
+                            "n_reference": reference_indices.len(),
+                            "min_cells_required": min_cells,
+                        }),
+                    );
+                    continue;
+                }
+                let de_opt = run_deseq2_pairwise(
+                    effective_counts,
+                    gene_names,
+                    &source_indices,
+                    &reference_indices,
+                    sample_labels,
+                    top_n,
+                    alpha,
+                );
+                match de_opt {
+                    None => {
+                        source_out.insert(
+                            reference.clone(),
+                            json!({
+                                "available": false,
+                                "reason": "insufficient_replicates",
+                                "genes": [],
+                                "logfoldchanges": [],
+                                "pvals": [],
+                                "pvals_adj": [],
+                                "scores": [],
+                                "pct_source": [],
+                                "pct_reference": [],
+                                "base_mean": [],
+                                "n_source": source_indices.len(),
+                                "n_reference": reference_indices.len(),
+                                "min_replicates_required": 2,
+                            }),
+                        );
+                    }
+                    Some(de) => {
+                        // Compute pct_source / pct_reference from the expr matrix.
+                        let (pct_source, pct_reference) = compute_pct_for_genes(
+                            expr_matrix,
+                            gene_names,
+                            &de.genes,
+                            &source_indices,
+                            &reference_indices,
+                        );
+                        source_out.insert(
+                            reference.clone(),
+                            json!({
+                                "available": true,
+                                "genes": de.genes,
+                                "logfoldchanges": option_vec_to_json(&de.logfoldchanges),
+                                "pvals": option_vec_to_json(&de.pvals),
+                                "pvals_adj": option_vec_to_json(&de.pvals_adj),
+                                "scores": option_vec_to_json(&de.scores),
+                                "pct_source": pct_source,
+                                "pct_reference": pct_reference,
+                                "base_mean": option_vec_to_json(&de.base_mean),
+                                "n_source": source_indices.len(),
+                                "n_reference": reference_indices.len(),
+                            }),
+                        );
+                    }
+                }
+            }
+            if !source_out.is_empty() {
+                group_out.insert(source.clone(), Value::Object(source_out));
+            }
+        }
+        if !group_out.is_empty() {
+            out.insert(column_name.clone(), Value::Object(group_out));
+        }
+    }
+    if let Some(stage) = stage {
+        stage.finish(format!(
+            "columns={}, alpha={alpha}",
+            categorical_columns.len()
+        ));
+    }
+    Value::Object(out)
+}
+
+/// Compute fraction of cells with non-zero expression for a list of gene names
+/// in each of two cell groups.
+fn compute_pct_for_genes(
+    matrix: &ExpressionMatrix,
+    all_gene_names: &[String],
+    selected_gene_names: &[String],
+    group_a: &[usize],
+    group_b: &[usize],
+) -> (Value, Value) {
+    let lookup: HashMap<&str, usize> = all_gene_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    let mut pct_a = Vec::with_capacity(selected_gene_names.len());
+    let mut pct_b = Vec::with_capacity(selected_gene_names.len());
+    for gene_name in selected_gene_names {
+        let Some(&gene_idx) = lookup.get(gene_name.as_str()) else {
+            pct_a.push(Value::Null);
+            pct_b.push(Value::Null);
+            continue;
+        };
+        let nnz_a = group_a
+            .iter()
+            .filter(|&&cell| matrix.get(cell, gene_idx) != 0.0)
+            .count();
+        let nnz_b = group_b
+            .iter()
+            .filter(|&&cell| matrix.get(cell, gene_idx) != 0.0)
+            .count();
+        pct_a.push(if group_a.is_empty() {
+            Value::Null
+        } else {
+            json!(nnz_a as f64 / group_a.len() as f64)
+        });
+        pct_b.push(if group_b.is_empty() {
+            Value::Null
+        } else {
+            json!(nnz_b as f64 / group_b.len() as f64)
+        });
+    }
+    (Value::Array(pct_a), Value::Array(pct_b))
+}
+
 fn compute_cluster_de(
     matrix: &ExpressionMatrix,
     gene_names: &[String],
@@ -1388,6 +1838,7 @@ fn compute_cluster_de(
                             "reason": "insufficient_cells",
                             "genes": [],
                             "logfoldchanges": [],
+                            "pvals": [],
                             "pvals_adj": [],
                             "scores": [],
                             "pct_source": [],
@@ -1420,6 +1871,9 @@ fn compute_cluster_de(
                         top_n,
                         method,
                     ),
+                    DeMethod::Deseq2 => {
+                        unreachable!("DESeq2 dispatches via compute_cluster_de_deseq2")
+                    }
                 };
                 source_out.insert(
                     reference.clone(),
@@ -1427,10 +1881,12 @@ fn compute_cluster_de(
                         "available": true,
                         "genes": de.genes,
                         "logfoldchanges": option_vec_to_json(&de.logfoldchanges),
+                        "pvals": option_vec_to_json(&de.pvals),
                         "pvals_adj": option_vec_to_json(&de.pvals_adj),
                         "scores": option_vec_to_json(&de.scores),
                         "pct_source": option_vec_to_json(&de.pct_a),
                         "pct_reference": option_vec_to_json(&de.pct_b),
+                        "base_mean": option_vec_to_json(&de.base_mean),
                         "n_source": source_indices.len(),
                         "n_reference": reference_indices.len(),
                     }),
@@ -1450,6 +1906,407 @@ fn compute_cluster_de(
             categorical_columns.len(),
             method
         ));
+    }
+    Value::Object(out)
+}
+
+/// Attach a `_summary` block to each column of the cluster-DE payload so the
+/// KaroSpace viewer can (a) render the per-category gene-means panel and (b)
+/// label the results as cell-level descriptive markers via `_summary.source`
+/// and `_summary.category_gene_means.source`.
+///
+/// The per-category means themselves are reused from the already-computed
+/// `cluster_gene_means` bundle (keyed by column → `{categories, means,
+/// background}`) rather than recomputed. We fold in the total cell count per
+/// category and the method-derived source tag. This makes the contract explicit
+/// on the Rust side; the KaroSpace Python loader's backfill becomes an
+/// idempotent no-op for files produced by this build.
+fn attach_cluster_de_summaries(
+    cluster_de: &mut Value,
+    cluster_gene_means: &Value,
+    categorical_columns: &[(String, Vec<String>, Vec<String>)],
+    method: DeMethod,
+) {
+    let Value::Object(cluster_de_map) = cluster_de else {
+        return;
+    };
+    let source_tag = method.source_tag();
+    let genes = cluster_gene_means
+        .get("genes")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let columns = cluster_gene_means.get("columns");
+
+    for (column_name, values, categories) in categorical_columns {
+        let Some(Value::Object(column_payload)) = cluster_de_map.get_mut(column_name) else {
+            continue;
+        };
+
+        // Total cells per category (independent of the per-pair min_cells filter).
+        let mut n_cells = Map::new();
+        for category in categories {
+            let count = values.iter().filter(|value| *value == category).count();
+            n_cells.insert(category.clone(), json!(count));
+        }
+
+        let mut category_gene_means = Map::new();
+        category_gene_means.insert("genes".to_string(), genes.clone());
+        if let Some(column_means) = columns.and_then(|columns| columns.get(column_name)) {
+            for key in ["categories", "means", "background"] {
+                if let Some(value) = column_means.get(key) {
+                    category_gene_means.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        category_gene_means.insert("n_cells".to_string(), Value::Object(n_cells));
+        category_gene_means.insert("source".to_string(), Value::String(source_tag.to_string()));
+
+        let mut summary = Map::new();
+        summary.insert(
+            "category_gene_means".to_string(),
+            Value::Object(category_gene_means),
+        );
+        summary.insert("source".to_string(), Value::String(source_tag.to_string()));
+        column_payload.insert("_summary".to_string(), Value::Object(summary));
+    }
+}
+
+/// Build a KaroSpace `pseudobulk_de` leaf (available contrast) from a computed
+/// [`DifferentialExpressionResult`], using the KaroSpace field names
+/// (`features` / `log2foldchanges`) and carrying `method` + `contrast_type`.
+fn karospace_available_leaf(
+    de: &DifferentialExpressionResult,
+    pct_source: Value,
+    pct_reference: Value,
+    n_source: usize,
+    n_reference: usize,
+    method_tag: &str,
+    contrast_type: &str,
+) -> Value {
+    json!({
+        "available": true,
+        "method": method_tag,
+        "contrast_type": contrast_type,
+        "features": de.genes.clone(),
+        "log2foldchanges": option_vec_to_json(&de.logfoldchanges),
+        "pvals": option_vec_to_json(&de.pvals),
+        "pvals_adj": option_vec_to_json(&de.pvals_adj),
+        "scores": option_vec_to_json(&de.scores),
+        "pct_source": pct_source,
+        "pct_reference": pct_reference,
+        "base_mean": option_vec_to_json(&de.base_mean),
+        "n_source": n_source,
+        "n_reference": n_reference,
+    })
+}
+
+/// Build a KaroSpace `pseudobulk_de` leaf for a contrast that could not be run.
+fn karospace_unavailable_leaf(
+    reason: &str,
+    n_source: usize,
+    n_reference: usize,
+    min_cells_required: Option<usize>,
+    method_tag: &str,
+    contrast_type: &str,
+) -> Value {
+    let mut leaf = json!({
+        "available": false,
+        "reason": reason,
+        "method": method_tag,
+        "contrast_type": contrast_type,
+        "features": [],
+        "log2foldchanges": [],
+        "pvals": [],
+        "pvals_adj": [],
+        "scores": [],
+        "pct_source": [],
+        "pct_reference": [],
+        "base_mean": [],
+        "n_source": n_source,
+        "n_reference": n_reference,
+    });
+    if let Some(min_cells) = min_cells_required {
+        leaf["min_cells_required"] = json!(min_cells);
+    }
+    if reason == "insufficient_replicates" {
+        leaf["min_replicates_required"] = json!(2);
+    }
+    leaf
+}
+
+/// Compute one-vs-rest (`__rest__`) cluster-DE contrasts in KaroSpace format:
+/// each category is compared against all other cells pooled. Returns a map keyed
+/// `column -> source_category -> leaf`. Mirrors the pairwise dispatch in
+/// [`compute_cluster_de`] / [`compute_cluster_de_deseq2`] but with a pooled
+/// reference and `contrast_type: "balanced_rest"`.
+fn compute_cluster_de_rest(
+    expr_matrix: &ExpressionMatrix,
+    counts_matrix: Option<&ExpressionMatrix>,
+    gene_names: &[String],
+    categorical_columns: &[(String, Vec<String>, Vec<String>)],
+    sample_labels: Option<&[String]>,
+    top_n: usize,
+    min_cells: usize,
+    alpha: f64,
+    method: DeMethod,
+    reporter: Option<&ProgressReporter>,
+) -> Value {
+    let mut stage = reporter.map(|r| r.stage("Computing cluster DE (one-vs-rest)"));
+    let method_tag = method.karospace_method_tag();
+    let effective_counts = counts_matrix.unwrap_or(expr_matrix);
+    let mut out = Map::new();
+
+    for (column_idx, (column_name, values, categories)) in categorical_columns.iter().enumerate() {
+        if let Some(stage) = stage.as_mut() {
+            stage.progress("columns", column_idx + 1, categorical_columns.len());
+        }
+        // Welch (t-test) reuses per-category summaries so rest = total − source.
+        let summary = if matches!(method, DeMethod::TTest) {
+            Some(build_categorical_column_summary(
+                expr_matrix,
+                values,
+                categories,
+            ))
+        } else {
+            None
+        };
+        let all_gene_indices = (0..expr_matrix.ncols()).collect::<Vec<_>>();
+        let mut column_out = Map::new();
+        for (source_idx, source) in categories.iter().enumerate() {
+            let source_indices: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, v)| if v == source { Some(idx) } else { None })
+                .collect();
+            let rest_indices: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, v)| if v != source { Some(idx) } else { None })
+                .collect();
+            if source_indices.len() < min_cells || rest_indices.len() < min_cells {
+                column_out.insert(
+                    source.clone(),
+                    karospace_unavailable_leaf(
+                        "insufficient_cells",
+                        source_indices.len(),
+                        rest_indices.len(),
+                        Some(min_cells),
+                        method_tag,
+                        "balanced_rest",
+                    ),
+                );
+                continue;
+            }
+            let leaf = match method {
+                DeMethod::TTest => {
+                    let summary = summary.as_ref().expect("summary available");
+                    let group_a = &summary.group_summaries[source_idx];
+                    let group_b = subtract_group_summary(&summary.total, group_a);
+                    let de = differential_expression_from_summaries(
+                        gene_names,
+                        &all_gene_indices,
+                        group_a,
+                        &group_b,
+                        top_n,
+                    );
+                    karospace_available_leaf(
+                        &de,
+                        option_vec_to_json(&de.pct_a),
+                        option_vec_to_json(&de.pct_b),
+                        source_indices.len(),
+                        rest_indices.len(),
+                        method_tag,
+                        "balanced_rest",
+                    )
+                }
+                DeMethod::Wilcoxon => {
+                    let de = differential_expression(
+                        expr_matrix,
+                        gene_names,
+                        &source_indices,
+                        &rest_indices,
+                        top_n,
+                        method,
+                    );
+                    karospace_available_leaf(
+                        &de,
+                        option_vec_to_json(&de.pct_a),
+                        option_vec_to_json(&de.pct_b),
+                        source_indices.len(),
+                        rest_indices.len(),
+                        method_tag,
+                        "balanced_rest",
+                    )
+                }
+                DeMethod::Deseq2 => {
+                    match run_deseq2_pairwise(
+                        effective_counts,
+                        gene_names,
+                        &source_indices,
+                        &rest_indices,
+                        sample_labels,
+                        top_n,
+                        alpha,
+                    ) {
+                        None => karospace_unavailable_leaf(
+                            "insufficient_replicates",
+                            source_indices.len(),
+                            rest_indices.len(),
+                            None,
+                            method_tag,
+                            "balanced_rest",
+                        ),
+                        Some(de) => {
+                            let (pct_source, pct_reference) = compute_pct_for_genes(
+                                expr_matrix,
+                                gene_names,
+                                &de.genes,
+                                &source_indices,
+                                &rest_indices,
+                            );
+                            karospace_available_leaf(
+                                &de,
+                                pct_source,
+                                pct_reference,
+                                source_indices.len(),
+                                rest_indices.len(),
+                                method_tag,
+                                "balanced_rest",
+                            )
+                        }
+                    }
+                }
+            };
+            column_out.insert(source.clone(), leaf);
+        }
+        if !column_out.is_empty() {
+            out.insert(column_name.clone(), Value::Object(column_out));
+        }
+    }
+    if let Some(stage) = stage {
+        stage.finish(format!("columns={}", categorical_columns.len()));
+    }
+    Value::Object(out)
+}
+
+/// Relabel a legacy pairwise cluster-DE leaf into KaroSpace field names
+/// (`genes`→`features`, `logfoldchanges`→`log2foldchanges`) and stamp the
+/// `method` / `contrast_type` the viewer expects. Non-object values pass through.
+fn karospace_relabel_leaf(leaf: &Value, method_tag: &str) -> Value {
+    let Value::Object(map) = leaf else {
+        return leaf.clone();
+    };
+    let mut out = map.clone();
+    if let Some(features) = out.remove("genes") {
+        out.insert("features".to_string(), features);
+    }
+    if let Some(log2fc) = out.remove("logfoldchanges") {
+        out.insert("log2foldchanges".to_string(), log2fc);
+    }
+    out.insert("method".to_string(), json!(method_tag));
+    out.entry("contrast_type")
+        .or_insert_with(|| json!("category_vs_category"));
+    Value::Object(out)
+}
+
+/// Relabel the legacy `_summary` block (`category_gene_means` with a `genes`
+/// array and a `companion_*` source) into the KaroSpace `category_feature_means`
+/// shape with a `features` array and a viewer-recognised `source` tag.
+fn karospace_relabel_summary(summary: &Value, source_tag: &str) -> Value {
+    let mut out = Map::new();
+    if let Some(Value::Object(means)) = summary.get("category_gene_means") {
+        let mut cfm = means.clone();
+        if let Some(features) = cfm.remove("genes") {
+            cfm.insert("features".to_string(), features);
+        }
+        cfm.insert("source".to_string(), json!(source_tag));
+        out.insert("category_feature_means".to_string(), Value::Object(cfm));
+    }
+    out.insert("source".to_string(), json!(source_tag));
+    Value::Object(out)
+}
+
+/// Assemble the KaroSpace `pseudobulk_de` payload from the legacy pairwise
+/// cluster-DE value (renamed in place, no recompute) plus freshly-computed
+/// one-vs-rest `__rest__` contrasts. Keying is preserved as
+/// `column -> source -> (reference | "__rest__")` with a sibling `_summary`.
+fn build_pseudobulk_de(cluster_de: &Value, rest_contrasts: &Value, method: DeMethod) -> Value {
+    let method_tag = method.karospace_method_tag();
+    let source_tag = method.karospace_source_tag();
+    let Value::Object(columns) = cluster_de else {
+        return json!({});
+    };
+    let mut out = Map::new();
+    for (column_name, column_value) in columns {
+        let Value::Object(column_map) = column_value else {
+            continue;
+        };
+        let mut column_out = Map::new();
+        for (source, references) in column_map {
+            if source.starts_with('_') {
+                continue;
+            }
+            let Value::Object(reference_map) = references else {
+                continue;
+            };
+            let mut source_out = Map::new();
+            for (reference, leaf) in reference_map {
+                source_out.insert(reference.clone(), karospace_relabel_leaf(leaf, method_tag));
+            }
+            if let Some(rest_leaf) = rest_contrasts.get(column_name).and_then(|c| c.get(source)) {
+                source_out.insert("__rest__".to_string(), rest_leaf.clone());
+            }
+            column_out.insert(source.clone(), Value::Object(source_out));
+        }
+        if let Some(summary) = column_map.get("_summary") {
+            column_out.insert(
+                "_summary".to_string(),
+                karospace_relabel_summary(summary, source_tag),
+            );
+        }
+        out.insert(column_name.clone(), Value::Object(column_out));
+    }
+    Value::Object(out)
+}
+
+/// Relabel interaction-marker leaves (`column -> source -> target -> leaf`) into
+/// KaroSpace field names (`genes`→`features`, `logfoldchanges`→`log2foldchanges`)
+/// for `uns` ingestion, leaving the interaction-specific contact fields intact.
+fn karospace_interaction_markers(interaction_markers: &Value) -> Value {
+    let Value::Object(columns) = interaction_markers else {
+        return interaction_markers.clone();
+    };
+    let mut out = Map::new();
+    for (column_name, sources) in columns {
+        let Value::Object(source_map) = sources else {
+            out.insert(column_name.clone(), sources.clone());
+            continue;
+        };
+        let mut column_out = Map::new();
+        for (source, targets) in source_map {
+            let Value::Object(target_map) = targets else {
+                column_out.insert(source.clone(), targets.clone());
+                continue;
+            };
+            let mut source_out = Map::new();
+            for (target, leaf) in target_map {
+                let relabelled = if let Value::Object(map) = leaf {
+                    let mut m = map.clone();
+                    if let Some(features) = m.remove("genes") {
+                        m.insert("features".to_string(), features);
+                    }
+                    if let Some(log2fc) = m.remove("logfoldchanges") {
+                        m.insert("log2foldchanges".to_string(), log2fc);
+                    }
+                    Value::Object(m)
+                } else {
+                    leaf.clone()
+                };
+                source_out.insert(target.clone(), relabelled);
+            }
+            column_out.insert(source.clone(), Value::Object(source_out));
+        }
+        out.insert(column_name.clone(), Value::Object(column_out));
     }
     Value::Object(out)
 }
@@ -1843,7 +2700,10 @@ fn differential_expression_from_summaries(
         let logfc = ((mean_a + 1e-9) / (mean_b + 1e-9)).log2();
         let pct_a = group_a.nnz[gene_idx] as f64 / group_a.n_cells.max(1) as f64;
         let pct_b = group_b.nnz[gene_idx] as f64 / group_b.n_cells.max(1) as f64;
-        stats.push((gene_idx, score, p_value, logfc, pct_a, pct_b));
+        // Pooled mean across both groups (cell-level baseMean analog).
+        let base_mean = (group_a.sums[gene_idx] + group_b.sums[gene_idx])
+            / (group_a.n_cells + group_b.n_cells).max(1) as f64;
+        stats.push((gene_idx, score, p_value, logfc, pct_a, pct_b, base_mean));
     }
 
     finalize_de_stats(gene_names, stats, top_n)
@@ -1872,9 +2732,13 @@ fn differential_expression(
                 group_b.len(),
             ),
             DeMethod::Wilcoxon => wilcoxon_rank_sum_score(matrix, gene_idx, group_a, group_b),
+            DeMethod::Deseq2 => unreachable!("DESeq2 dispatches via compute_cluster_de_deseq2"),
         };
         let p_value = two_sided_p_from_z(score);
         let logfc = ((mean_a[gene_idx] + 1e-9) / (mean_b[gene_idx] + 1e-9)).log2();
+        let base_mean = (mean_a[gene_idx] * group_a.len() as f64
+            + mean_b[gene_idx] * group_b.len() as f64)
+            / (group_a.len() + group_b.len()).max(1) as f64;
         stats.push((
             gene_idx,
             score,
@@ -1882,6 +2746,7 @@ fn differential_expression(
             logfc,
             pct_a[gene_idx],
             pct_b[gene_idx],
+            base_mean,
         ));
     }
 
@@ -1913,6 +2778,9 @@ fn differential_expression_subset(
                 );
                 let p_value = two_sided_p_from_z(score);
                 let logfc = ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
+                let base_mean = (mean_a[offset] * group_a.len() as f64
+                    + mean_b[offset] * group_b.len() as f64)
+                    / (group_a.len() + group_b.len()).max(1) as f64;
                 stats.push((
                     gene_idx,
                     score,
@@ -1920,6 +2788,7 @@ fn differential_expression_subset(
                     logfc,
                     pct_a[offset],
                     pct_b[offset],
+                    base_mean,
                 ));
             }
             finalize_de_stats(gene_names, stats, top_n)
@@ -1934,6 +2803,9 @@ fn differential_expression_subset(
                     let score = wilcoxon_rank_sum_score(matrix, gene_idx, group_a, group_b);
                     let p_value = two_sided_p_from_z(score);
                     let logfc = ((mean_a[offset] + 1e-9) / (mean_b[offset] + 1e-9)).log2();
+                    let base_mean = (mean_a[offset] * group_a.len() as f64
+                        + mean_b[offset] * group_b.len() as f64)
+                        / (group_a.len() + group_b.len()).max(1) as f64;
                     (
                         gene_idx,
                         score,
@@ -1941,23 +2813,25 @@ fn differential_expression_subset(
                         logfc,
                         pct_a[offset],
                         pct_b[offset],
+                        base_mean,
                     )
                 })
                 .collect();
             finalize_de_stats(gene_names, stats, top_n)
         }
+        DeMethod::Deseq2 => unreachable!("DESeq2 dispatches via compute_cluster_de_deseq2"),
     }
 }
 
 fn finalize_de_stats(
     gene_names: &[String],
-    stats: Vec<(usize, f64, f64, f64, f64, f64)>,
+    stats: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
     top_n: usize,
 ) -> DifferentialExpressionResult {
     let (valid_indices, valid_p_values): (Vec<usize>, Vec<f64>) = stats
         .iter()
         .enumerate()
-        .filter_map(|(i, (_, score, p, _, _, _))| {
+        .filter_map(|(i, (_, score, p, _, _, _, _))| {
             if score.is_finite() {
                 Some((i, *p))
             } else {
@@ -1970,44 +2844,65 @@ fn finalize_de_stats(
     for (pos, orig_idx) in valid_indices.iter().enumerate() {
         adjusted[*orig_idx] = adjusted_valid[pos];
     }
+    // Carry the raw (pre-BH) p-value alongside the adjusted one so the viewer can
+    // surface both a raw-p column and the adjusted column.
     let mut scored = stats
         .into_iter()
         .enumerate()
-        .map(|(idx, (gene_idx, score, _p, logfc, pct_a, pct_b))| {
-            (gene_idx, score, adjusted[idx], logfc, pct_a, pct_b)
-        })
+        .map(
+            |(idx, (gene_idx, score, raw_p, logfc, pct_a, pct_b, base_mean))| {
+                (
+                    gene_idx,
+                    score,
+                    raw_p,
+                    adjusted[idx],
+                    logfc,
+                    pct_a,
+                    pct_b,
+                    base_mean,
+                )
+            },
+        )
         .collect::<Vec<_>>();
     scored.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
 
     let top = scored
         .into_iter()
-        .filter(|(_, score, _, _, _, _)| score.is_finite())
+        .filter(|(_, score, _, _, _, _, _, _)| score.is_finite())
         .take(top_n)
         .collect::<Vec<_>>();
     DifferentialExpressionResult {
         genes: top
             .iter()
-            .map(|(gene_idx, _, _, _, _, _)| gene_names[*gene_idx].clone())
+            .map(|(gene_idx, _, _, _, _, _, _, _)| gene_names[*gene_idx].clone())
             .collect(),
         logfoldchanges: top
             .iter()
-            .map(|(_, _, _, value, _, _)| finite_or_none(*value))
+            .map(|(_, _, _, _, value, _, _, _)| finite_or_none(*value))
+            .collect(),
+        pvals: top
+            .iter()
+            .map(|(_, _, value, _, _, _, _, _)| finite_or_none(*value))
             .collect(),
         pvals_adj: top
             .iter()
-            .map(|(_, _, value, _, _, _)| finite_or_none(*value))
+            .map(|(_, _, _, value, _, _, _, _)| finite_or_none(*value))
             .collect(),
         scores: top
             .iter()
-            .map(|(_, value, _, _, _, _)| finite_or_none(*value))
+            .map(|(_, value, _, _, _, _, _, _)| finite_or_none(*value))
             .collect(),
         pct_a: top
             .iter()
-            .map(|(_, _, _, _, value, _)| finite_or_none(*value))
+            .map(|(_, _, _, _, _, value, _, _)| finite_or_none(*value))
             .collect(),
         pct_b: top
             .iter()
-            .map(|(_, _, _, _, _, value)| finite_or_none(*value))
+            .map(|(_, _, _, _, _, _, value, _)| finite_or_none(*value))
+            .collect(),
+        base_mean: top
+            .iter()
+            .map(|(_, _, _, _, _, _, _, value)| finite_or_none(*value))
             .collect(),
     }
 }
@@ -2466,6 +3361,8 @@ mod tests {
                 cluster_de_method: DeMethod::TTest,
                 cluster_de_top_n: 3,
                 cluster_de_min_cells: 1,
+                cluster_de_deseq2_sample_column: None,
+                cluster_de_deseq2_alpha: 0.05,
                 neighbor_stats_permutations: Some(4),
                 neighbor_stats_seed: 0,
                 interaction_markers_method: DeMethod::TTest,
@@ -2523,6 +3420,8 @@ mod tests {
                     cluster_de_method: DeMethod::TTest,
                     cluster_de_top_n: 3,
                     cluster_de_min_cells: 1,
+                    cluster_de_deseq2_sample_column: None,
+                    cluster_de_deseq2_alpha: 0.05,
                     neighbor_stats_permutations: Some(4),
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::TTest,
@@ -2562,6 +3461,8 @@ mod tests {
             cluster_de_method: DeMethod::TTest,
             cluster_de_top_n: 0,
             cluster_de_min_cells: 0,
+            cluster_de_deseq2_sample_column: None,
+            cluster_de_deseq2_alpha: 0.05,
             neighbor_stats_permutations: Some(5),
             neighbor_stats_seed: 0,
             interaction_markers_method: DeMethod::TTest,

@@ -604,6 +604,8 @@ mod tests {
                     cluster_de_method: DeMethod::TTest,
                     cluster_de_top_n: 2,
                     cluster_de_min_cells: 1,
+                    cluster_de_deseq2_sample_column: None,
+                    cluster_de_deseq2_alpha: 0.05,
                     neighbor_stats_permutations: Some(4),
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::TTest,
@@ -622,13 +624,16 @@ mod tests {
             let group = file.group("uns/karospace_companion").unwrap();
             assert!(group.link_exists("analytics_storage"));
             assert!(group.link_exists("analytics_columns"));
-            assert!(group.link_exists("marker_genes_json"));
-            assert!(group.link_exists("cluster_de_json"));
+            // KaroSpace ingests only these three companion analytics blocks.
+            assert!(group.link_exists("pseudobulk_de_json"));
             assert!(group.link_exists("neighbor_stats_json"));
             assert!(group.link_exists("interaction_markers_json"));
-            assert!(group.link_exists("gene_correlations_json"));
-            assert!(group.link_exists("spatial_variable_genes_json"));
-            assert!(group.link_exists("cluster_gene_means_json"));
+            // Legacy keys KaroSpace no longer reads must not be emitted.
+            assert!(!group.link_exists("marker_genes_json"));
+            assert!(!group.link_exists("cluster_de_json"));
+            assert!(!group.link_exists("gene_correlations_json"));
+            assert!(!group.link_exists("spatial_variable_genes_json"));
+            assert!(!group.link_exists("cluster_gene_means_json"));
         });
     }
 
