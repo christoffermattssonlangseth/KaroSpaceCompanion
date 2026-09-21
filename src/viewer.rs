@@ -64,8 +64,15 @@ pub struct ViewerPrecomputeConfig {
     /// Required when `cluster_de_method` is `Deseq2`; each unique value in that
     /// column becomes one pseudobulk sample.
     pub cluster_de_deseq2_sample_column: Option<String>,
-    /// BH-adjusted p-value threshold for DESeq2 independent filtering.
+    /// BH-adjusted p-value threshold for DESeq2 independent filtering. Also
+    /// stamped onto each KaroSpace `pseudobulk_de` leaf as `padj_cutoff` so the
+    /// viewer's significant-feature count uses this threshold instead of its
+    /// 0.05 fallback.
     pub cluster_de_deseq2_alpha: f64,
+    /// Absolute log2 fold-change threshold stamped onto each KaroSpace
+    /// `pseudobulk_de` leaf as `log2fc_cutoff`, so the viewer counts significant
+    /// features against this cutoff instead of its 0.5 fallback.
+    pub cluster_de_log2fc_cutoff: f64,
     pub neighbor_stats_permutations: Option<usize>,
     pub neighbor_stats_seed: u64,
     pub interaction_markers_method: DeMethod,
@@ -532,7 +539,13 @@ fn compute_companion_analytics_from_loaded(
         config.cluster_de_method,
         Some(reporter),
     );
-    let pseudobulk_de = build_pseudobulk_de(&cluster_de, &rest_contrasts, config.cluster_de_method);
+    let pseudobulk_de = build_pseudobulk_de(
+        &cluster_de,
+        &rest_contrasts,
+        config.cluster_de_method,
+        config.cluster_de_deseq2_alpha,
+        config.cluster_de_log2fc_cutoff,
+    );
 
     let neighbor_stats_permutations =
         resolve_neighbor_stats_permutations(config, adata.obs_names.len());
@@ -1659,6 +1672,7 @@ fn compute_cluster_de_deseq2(
                             "n_source": source_indices.len(),
                             "n_reference": reference_indices.len(),
                             "min_cells_required": min_cells,
+                            "min_replicates_required": 2,
                         }),
                     );
                     continue;
@@ -1689,6 +1703,7 @@ fn compute_cluster_de_deseq2(
                                 "base_mean": [],
                                 "n_source": source_indices.len(),
                                 "n_reference": reference_indices.len(),
+                                "min_cells_required": min_cells,
                                 "min_replicates_required": 2,
                             }),
                         );
@@ -2226,11 +2241,35 @@ fn karospace_relabel_summary(summary: &Value, source_tag: &str) -> Value {
     Value::Object(out)
 }
 
+/// Ensure a `pseudobulk_de` leaf carries the fidelity fields the KaroSpace
+/// viewer reads: `padj_cutoff` / `log2fc_cutoff` (the significant-feature count
+/// thresholds, which otherwise fall back to 0.05 / 0.5) and a `base_mean` array
+/// (empty on unavailable contrasts, where some code paths omit it). Existing
+/// values are never overwritten — this only backfills keys a path left out.
+fn ensure_leaf_fidelity(leaf: &mut Value, padj_cutoff: f64, log2fc_cutoff: f64) {
+    let Value::Object(map) = leaf else {
+        return;
+    };
+    map.entry("padj_cutoff")
+        .or_insert_with(|| json!(padj_cutoff));
+    map.entry("log2fc_cutoff")
+        .or_insert_with(|| json!(log2fc_cutoff));
+    map.entry("base_mean").or_insert_with(|| json!([]));
+}
+
 /// Assemble the KaroSpace `pseudobulk_de` payload from the legacy pairwise
 /// cluster-DE value (renamed in place, no recompute) plus freshly-computed
 /// one-vs-rest `__rest__` contrasts. Keying is preserved as
 /// `column -> source -> (reference | "__rest__")` with a sibling `_summary`.
-fn build_pseudobulk_de(cluster_de: &Value, rest_contrasts: &Value, method: DeMethod) -> Value {
+/// Every contrast leaf is stamped with the viewer fidelity fields via
+/// [`ensure_leaf_fidelity`]; the `_summary` block is left untouched.
+fn build_pseudobulk_de(
+    cluster_de: &Value,
+    rest_contrasts: &Value,
+    method: DeMethod,
+    padj_cutoff: f64,
+    log2fc_cutoff: f64,
+) -> Value {
     let method_tag = method.karospace_method_tag();
     let source_tag = method.karospace_source_tag();
     let Value::Object(columns) = cluster_de else {
@@ -2255,6 +2294,9 @@ fn build_pseudobulk_de(cluster_de: &Value, rest_contrasts: &Value, method: DeMet
             }
             if let Some(rest_leaf) = rest_contrasts.get(column_name).and_then(|c| c.get(source)) {
                 source_out.insert("__rest__".to_string(), rest_leaf.clone());
+            }
+            for leaf in source_out.values_mut() {
+                ensure_leaf_fidelity(leaf, padj_cutoff, log2fc_cutoff);
             }
             column_out.insert(source.clone(), Value::Object(source_out));
         }
@@ -3363,6 +3405,7 @@ mod tests {
                 cluster_de_min_cells: 1,
                 cluster_de_deseq2_sample_column: None,
                 cluster_de_deseq2_alpha: 0.05,
+                cluster_de_log2fc_cutoff: 0.5,
                 neighbor_stats_permutations: Some(4),
                 neighbor_stats_seed: 0,
                 interaction_markers_method: DeMethod::TTest,
@@ -3422,6 +3465,7 @@ mod tests {
                     cluster_de_min_cells: 1,
                     cluster_de_deseq2_sample_column: None,
                     cluster_de_deseq2_alpha: 0.05,
+                    cluster_de_log2fc_cutoff: 0.5,
                     neighbor_stats_permutations: Some(4),
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::TTest,
@@ -3463,6 +3507,7 @@ mod tests {
             cluster_de_min_cells: 0,
             cluster_de_deseq2_sample_column: None,
             cluster_de_deseq2_alpha: 0.05,
+            cluster_de_log2fc_cutoff: 0.5,
             neighbor_stats_permutations: Some(5),
             neighbor_stats_seed: 0,
             interaction_markers_method: DeMethod::TTest,

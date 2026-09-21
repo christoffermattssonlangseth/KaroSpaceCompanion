@@ -606,6 +606,7 @@ mod tests {
                     cluster_de_min_cells: 1,
                     cluster_de_deseq2_sample_column: None,
                     cluster_de_deseq2_alpha: 0.05,
+                    cluster_de_log2fc_cutoff: 0.5,
                     neighbor_stats_permutations: Some(4),
                     neighbor_stats_seed: 0,
                     interaction_markers_method: DeMethod::TTest,

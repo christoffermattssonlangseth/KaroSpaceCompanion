@@ -53,14 +53,14 @@ The v1 `prepare` command:
 - optionally writes `obsm["X_karo_comp"]`
 - optionally writes `obsm["X_karo_nmf"]` and `varm["X_karo_nmf_loadings"]`
 - records provenance in `uns["karospace_companion"]`
-- can persist downstream analytics directly into `uns["karospace_companion"]`, including:
-  - `marker_genes_json`
-  - `cluster_de_json`
+- can persist downstream analytics directly into `uns["karospace_companion"]`. Only
+  the three blocks the KaroSpace viewer actually ingests
+  (`data_loader.py:_load_companion_analytics`) are written, as JSON strings under
+  `analytics_storage = "json-string-v1"`:
+  - `pseudobulk_de_json` — KaroSpace-format cluster DE: `column -> source -> (reference | "__rest__") -> leaf` plus a `_summary` with `category_feature_means`. Each leaf carries `padj_cutoff` / `log2fc_cutoff` (from `--viewer-deseq2-alpha` / `--viewer-log2fc-cutoff`) so the viewer's significant-feature counts match the companion's thresholds.
   - `neighbor_stats_json`
   - `interaction_markers_json`
-  - `gene_correlations_json`
-  - `spatial_variable_genes_json`
-  - `cluster_gene_means_json`
+  - The former `marker_genes_json` / `cluster_de_json` / `gene_correlations_json` / `spatial_variable_genes_json` / `cluster_gene_means_json` keys are no longer emitted (and are purged on re-prepare); KaroSpace recomputes correlations and spatial-variable features itself and derives markers / gene-means from `pseudobulk_de`.
 - optionally writes a KaroSpace viewer sidecar JSON with:
   - per-section coordinates, obs indices, colors, UMAP coordinates, gene vectors, and edges
   - `colors_meta`, `genes_meta`, `gene_encodings`, and categorical `metadata_filters`
